@@ -1,0 +1,58 @@
+{
+  "manifest_version": "0.2",
+  "name": "ninjaone-rmm",
+  "display_name": "NinjaONE RMM Server",
+  "version": "1.2.14",
+  "description": "Professional MCP server for NinjaONE RMM platform with comprehensive device management, monitoring, patch management, and automation capabilities",
+  "author": {
+    "name": "Lungshot",
+    "email": "support@ninjaone-mcp.dev",
+    "url": "https://github.com/Lungshot/NinjaOneMCP"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/Lungshot/NinjaOneMCP",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lungshot/NinjaOneMCP.git"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "NINJA_BASE_URL": "https://ca.ninjarmm.com",
+        "NINJA_CLIENT_ID": "REDACTED_CLIENT_ID",
+        "NINJA_CLIENT_SECRET": "REDACTED_CLIENT_SECRET",
+        "LOG_LEVEL": "${user_config.log_level}",
+        "NODE_ENV": "production"
+      }
+    }
+  },
+  "user_config": {
+    "log_level": {
+      "type": "string",
+      "title": "Log Level",
+      "description": "Logging level for debugging and monitoring",
+      "default": "info"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"]
+  },
+  "keywords": [
+    "ninjaone",
+    "rmm",
+    "remote-monitoring",
+    "device-management",
+    "msp",
+    "automation",
+    "infrastructure",
+    "monitoring",
+    "patches",
+    "antivirus"
+  ]
+}

@@ -1,0 +1,1785 @@
+﻿/**
+ * NinjaONE MCP Server - Optimized version without optional features
+ * Supports STDIO, HTTP, and SSE transports with fixed filtering
+ * MCP SDK v1.17.1 compatible
+ */
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { NinjaOneAPI } from './ninja-api.js';
+import type { MaintenanceUnit, MaintenanceWindowSelection } from './ninja-api.js';
+import { createHttpServer, createSseServer } from './transport/http.js';
+import { config } from 'dotenv';
+
+config();
+
+const MAINTENANCE_UNIT_SECONDS: Record<MaintenanceUnit, number> = {
+  MINUTES: 60,
+  HOURS: 60 * 60,
+  DAYS: 24 * 60 * 60,
+  WEEKS: 7 * 24 * 60 * 60
+};
+
+/**
+ * Fixed tool definitions - removed complex filtering, kept all functionality
+ */
+const TOOLS = [
+  // Device Management Tools
+  {
+    name: 'get_devices',
+    description: 'List all devices with basic filtering. Use simple filters only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' },
+        after: { type: 'number', description: 'Pagination cursor' },
+        df: { type: 'string', description: 'Simple device filter (e.g., "offline = true")' }
+      }
+    }
+  },
+  {
+    name: 'list_regions',
+    description: 'List supported NinjaONE regions and base URLs',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'set_region',
+    description: 'Set region or base URL for API requests',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        region: { type: 'string', description: 'Region key (us, us2, eu, ca, oc)' },
+        baseUrl: { type: 'string', description: 'Custom base URL (overrides region if provided)' }
+      }
+    }
+  },
+  {
+    name: 'get_device',
+    description: 'Get detailed information about a specific device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'reboot_device',
+    description: 'Reboot a device with normal or forced mode. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        mode: { type: 'string', enum: ['NORMAL', 'FORCED'], description: 'Reboot mode (default: NORMAL)' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'set_device_maintenance',
+    description: 'Set maintenance mode for a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        mode: { type: 'string', enum: ['ON', 'OFF'], description: 'Maintenance mode' },
+        duration: {
+          type: 'object',
+          description: 'Duration details when enabling maintenance mode',
+          properties: {
+            permanent: {
+              type: 'boolean',
+              description: 'Set true for permanent maintenance mode'
+            },
+            value: {
+              type: 'number',
+              description: 'Length of the maintenance window (required when not permanent)'
+            },
+            unit: {
+              type: 'string',
+              enum: ['MINUTES', 'HOURS', 'DAYS', 'WEEKS'],
+              description: 'Time unit for the maintenance window (required when not permanent)'
+            }
+          }
+        },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id', 'mode']
+    }
+  },
+  {
+    name: 'get_organizations',
+    description: 'List all organizations with pagination',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pageSize: { type: 'number', description: 'Number of results per page' },
+        after: { type: 'number', description: 'Pagination cursor' }
+      }
+    }
+  },
+  {
+    name: 'get_alerts',
+    description: 'Get system alerts with basic filtering',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: 'ISO timestamp for alerts since' }
+      }
+    }
+  },
+  {
+    name: 'get_device_activities',
+    description: 'Get activities for a specific device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        pageSize: { type: 'number', description: 'Number of results per page' }
+      },
+      required: ['id']
+    }
+  },
+  /**
+   * Get installed software inventory for a specific device.
+   * Returns the list of installed applications including version, publisher,
+   * and install date metadata for asset and compliance tracking.
+   * Useful for: software asset management, compliance audits, security assessments.
+   */
+  {
+    name: 'get_device_software',
+    description: 'Get installed software for a specific device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_device_dashboard_url',
+    description: 'Get the dashboard URL for a specific device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'search_devices_by_name',
+    description: 'Search devices by system name (client-side filtering)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'System name to search for' },
+        limit: { type: 'number', description: 'Maximum results to return (default: 10)' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'find_windows11_devices',
+    description: 'Find all Windows 11 devices (client-side filtering)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Maximum results to return (default: 20)' }
+      }
+    }
+  },
+
+  // Device Control
+  {
+    name: 'control_windows_service',
+    description: 'Control a Windows service on a device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        serviceId: { type: 'string', description: 'Service ID' },
+        action: { type: 'string', description: 'Action to perform (e.g., START, STOP, RESTART)' }
+      },
+      required: ['id', 'serviceId', 'action']
+    }
+  },
+  {
+    name: 'configure_windows_service',
+    description: 'Configure a Windows service startup type on a device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        serviceId: { type: 'string', description: 'Service ID' },
+        startupType: { type: 'string', description: 'Startup type (e.g., AUTOMATIC, MANUAL, DISABLED)' }
+      },
+      required: ['id', 'serviceId', 'startupType']
+    }
+  },
+  // Device Patching
+  {
+    name: 'scan_device_os_patches',
+    description: 'Scan for OS patches on a device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'apply_device_os_patches',
+    description: 'Apply OS patches on a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        patches: { type: 'array', items: { type: 'object' }, description: 'List of OS patches to apply' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id', 'patches']
+    }
+  },
+  {
+    name: 'scan_device_software_patches',
+    description: 'Scan for software patches on a device',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'apply_device_software_patches',
+    description: 'Apply software patches on a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        patches: { type: 'array', items: { type: 'object' }, description: 'List of software patches to apply' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id', 'patches']
+    }
+  },
+
+  // Organizations - details
+  {
+    name: 'get_organization',
+    description: 'Get organization details by ID',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'number', description: 'Organization ID' } },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_organization_locations',
+    description: 'Get locations for an organization',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'number', description: 'Organization ID' } },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_organization_policies',
+    description: 'Get policies for an organization',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'number', description: 'Organization ID' } },
+      required: ['id']
+    }
+  },
+  {
+    name: 'generate_organization_installer',
+    description: 'Generate installer for an organization/location',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        installerType: { type: 'string', description: 'Installer type (e.g., WINDOWS, MAC, LINUX)' },
+        organizationId: { type: 'number', description: 'Organization ID (optional if implied by auth)' },
+        locationId: { type: 'number', description: 'Location ID (optional)' }
+      },
+      required: ['installerType']
+    }
+  },
+  // Organization CRUD
+  // Delete operations are intentionally omitted because the public API
+  // does not expose organization or location removal endpoints.
+  {
+    name: 'create_organization',
+    description: 'Create a new organization',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Organization name' },
+        description: { type: 'string', description: 'Organization description' },
+        nodeApprovalMode: {
+          type: 'string',
+          description: 'Device approval mode (AUTOMATIC, MANUAL, REJECT)',
+          enum: ['AUTOMATIC', 'MANUAL', 'REJECT']
+        },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Tags' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'update_organization',
+    description: 'Update an organization (node approval mode is read-only after creation)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Organization ID' },
+        name: { type: 'string', description: 'Organization name' },
+        description: { type: 'string', description: 'Organization description' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Tags' }
+      },
+      required: ['id']
+    }
+  },
+
+  // Location CRUD
+  {
+    name: 'create_location',
+    description: 'Create a new location for an organization',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        organizationId: { type: 'number', description: 'Organization ID' },
+        name: { type: 'string', description: 'Location name' },
+        address: { type: 'string', description: 'Location address' },
+        description: { type: 'string', description: 'Location description' }
+      },
+      required: ['organizationId', 'name']
+    }
+  },
+  {
+    name: 'update_location',
+    description: 'Update a location',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        organizationId: { type: 'number', description: 'Organization ID' },
+        locationId: { type: 'number', description: 'Location ID' },
+        name: { type: 'string', description: 'Location name' },
+        address: { type: 'string', description: 'Location address' },
+        description: { type: 'string', description: 'Location description' }
+      },
+      required: ['organizationId', 'locationId']
+    }
+  },
+
+  // Alerts - details
+  {
+    name: 'get_alert',
+    description: 'Get a specific alert by UID',
+    inputSchema: {
+      type: 'object',
+      properties: { uid: { type: 'string', description: 'Alert UID' } },
+      required: ['uid']
+    }
+  },
+  {
+    name: 'reset_alert',
+    description: 'Reset/acknowledge an alert by UID. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        uid: { type: 'string', description: 'Alert UID' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['uid']
+    }
+  },
+  {
+    name: 'get_device_alerts',
+    description: 'Get alerts for a specific device',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'number', description: 'Device ID' }, lang: { type: 'string', description: 'Language code' } },
+      required: ['id']
+    }
+  },
+
+  // Users & Roles
+  {
+    name: 'get_end_users',
+    description: 'List end users',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_end_user',
+    description: 'Get an end user by ID',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] }
+  },
+  {
+    name: 'create_end_user',
+    description: 'Create a new end user',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        firstName: { type: 'string', description: 'First name of the end user' },
+        lastName: { type: 'string', description: 'Last name of the end user' },
+        email: { type: 'string', description: 'Email address of the end user' },
+        phone: { type: 'string', description: 'Phone number of the end user' },
+        organizationId: { type: 'number', description: 'Organization identifier' },
+        fullPortalAccess: { type: 'boolean', description: 'Grant full portal access' },
+        sendInvitation: { type: 'boolean', description: 'Send an invitation email to the end user' }
+      },
+      required: ['firstName', 'lastName', 'email']
+    }
+  },
+  {
+    name: 'update_end_user',
+    description: 'Update an end user (Note: phone field cannot be changed after creation)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'End user ID' },
+        firstName: { type: 'string', description: 'First name' },
+        lastName: { type: 'string', description: 'Last name' },
+        email: { type: 'string', description: 'Email address' },
+        phone: { type: 'string', description: 'Phone number (read-only after creation)' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'delete_end_user',
+    description: 'Delete an end user by ID',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'number', description: 'End user identifier' } },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_technicians',
+    description: 'List technicians',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_technician',
+    description: 'Get a technician by ID',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] }
+  },
+  {
+    name: 'add_role_members',
+    description: 'Add users to a role',
+    inputSchema: { type: 'object', properties: { roleId: { type: 'number' }, userIds: { type: 'array', items: { type: 'number' } } }, required: ['roleId', 'userIds'] }
+  },
+  {
+    name: 'remove_role_members',
+    description: 'Remove users from a role',
+    inputSchema: { type: 'object', properties: { roleId: { type: 'number' }, userIds: { type: 'array', items: { type: 'number' } } }, required: ['roleId', 'userIds'] }
+  },
+
+  // Contacts
+  {
+    name: 'get_contacts',
+    description: 'List contacts',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_contact',
+    description: 'Get a contact by ID',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] }
+  },
+  {
+    name: 'create_contact',
+    description: 'Create a contact',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        organizationId: { type: 'number' },
+        firstName: { type: 'string' },
+        lastName: { type: 'string' },
+        email: { type: 'string' },
+        phone: { type: 'string' },
+        jobTitle: { type: 'string' }
+      },
+      required: ['organizationId', 'firstName', 'lastName', 'email']
+    }
+  },
+  {
+    name: 'update_contact',
+    description: 'Update a contact',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number' },
+        firstName: { type: 'string' },
+        lastName: { type: 'string' },
+        email: { type: 'string' },
+        phone: { type: 'string' },
+        jobTitle: { type: 'string' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'delete_contact',
+    description: 'Delete a contact',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] }
+  },
+
+  // Device approvals and policy
+  {
+    name: 'approve_devices',
+    description: 'Approve or reject multiple devices. Set confirm=true to execute; default is dry-run.',
+    inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['APPROVE', 'REJECT'], description: 'APPROVE or REJECT' }, deviceIds: { type: 'array', items: { type: 'number' } }, confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' } }, required: ['mode', 'deviceIds'] }
+  },
+  {
+    name: 'get_device_policy_overrides',
+    description: 'Get policy overrides for a device',
+    inputSchema: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] }
+  },
+  {
+    name: 'reset_device_policy_overrides',
+    description: 'Reset/remove all policy overrides for a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_policies',
+    description: 'List policies (optionally templates only)',
+    inputSchema: { type: 'object', properties: { templateOnly: { type: 'boolean' } } }
+  },
+
+  // System Information Query Tools
+  {
+    name: 'query_antivirus_status',
+    description: 'Query antivirus status information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_antivirus_threats',
+    description: 'Query antivirus threat detections across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_computer_systems',
+    description: 'Query computer system information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_device_health',
+    description: 'Query device health status information',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_operating_systems',
+    description: 'Query operating system information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_logged_on_users',
+    description: 'Query currently logged on users across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+
+  // Hardware Query Tools
+  {
+    name: 'query_processors',
+    description: 'Query processor information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_disks',
+    description: 'Query disk drive information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_volumes',
+    description: 'Query disk volume information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_network_interfaces',
+    description: 'Query network interface information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_raid_controllers',
+    description: 'Query RAID controller information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_raid_drives',
+    description: 'Query RAID drive information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+
+  // Software and Patch Query Tools
+  {
+    name: 'query_software',
+    description: 'Query installed software across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_os_patches',
+    description: 'Query operating system patches across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_software_patches',
+    description: 'Query software patches across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_os_patch_installs',
+    description: 'Query OS patch installation history across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_software_patch_installs',
+    description: 'Query software patch installation history across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_windows_services',
+    description: 'Query Windows services across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+
+  // Custom Fields and Policy Query Tools
+  {
+    name: 'query_custom_fields',
+    description: 'Query custom field values across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_custom_fields_detailed',
+    description: 'Query detailed custom field information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_scoped_custom_fields',
+    description: 'Query scoped custom field values across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_scoped_custom_fields_detailed',
+    description: 'Query detailed scoped custom field information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+  {
+    name: 'query_policy_overrides',
+    description: 'Query policy override information across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+
+  // Backup Query Tools
+  {
+    name: 'query_backup_usage',
+    description: 'Query backup usage statistics across devices',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        df: { type: 'string', description: 'Device filter' },
+        cursor: { type: 'string', description: 'Pagination cursor' },
+        pageSize: { type: 'number', description: 'Number of results per page (default: 50)' }
+      }
+    }
+  },
+
+  // Auto-paginating search tools
+  {
+    name: 'search_software',
+    description: 'Search installed software across all devices by name. Auto-paginates and filters server-side — much faster than manually iterating query_software.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Software name to search for (case-insensitive partial match)' },
+        df: { type: 'string', description: 'Device filter (e.g., "org = 1")' },
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'search_os_patches',
+    description: 'Search OS patches across all devices by name. Auto-paginates and filters server-side.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Patch name/KB to search for (case-insensitive partial match)' },
+        df: { type: 'string', description: 'Device filter' },
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'search_windows_services',
+    description: 'Search Windows services across all devices by name. Auto-paginates and filters server-side.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Service name to search for (case-insensitive partial match)' },
+        df: { type: 'string', description: 'Device filter' },
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+      },
+      required: ['name']
+    }
+  },
+
+  // Phase 2 — Write operations with confirmation guardrails
+
+  {
+    name: 'update_device',
+    description: 'Update a device display name or user-defined fields. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        displayName: { type: 'string', description: 'New display name' },
+        userData: { type: 'object', description: 'Key-value pairs of user-defined fields' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'update_device_custom_fields',
+    description: 'Write custom field values on a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceId: { type: 'number', description: 'Device ID' },
+        fields: { type: 'object', description: 'Key-value pairs of custom fields to set' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['deviceId', 'fields']
+    }
+  },
+  {
+    name: 'update_org_custom_fields',
+    description: 'Write custom field values on an organization. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        orgId: { type: 'number', description: 'Organization ID' },
+        fields: { type: 'object', description: 'Key-value pairs of custom fields to set' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['orgId', 'fields']
+    }
+  },
+
+  // Ticketing
+  {
+    name: 'get_ticket_boards',
+    description: 'List all ticket boards',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_tickets',
+    description: 'List tickets from a board with pagination',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        boardId: { type: 'number', description: 'Ticket board ID' },
+        pageSize: { type: 'number', description: 'Results per page (default: 25)' },
+        after: { type: 'number', description: 'Pagination cursor' }
+      },
+      required: ['boardId']
+    }
+  },
+  {
+    name: 'get_ticket',
+    description: 'Get full detail for a single ticket',
+    inputSchema: {
+      type: 'object',
+      properties: { ticketId: { type: 'number', description: 'Ticket ID' } },
+      required: ['ticketId']
+    }
+  },
+  {
+    name: 'get_ticket_log',
+    description: 'Get activity log for a ticket',
+    inputSchema: {
+      type: 'object',
+      properties: { ticketId: { type: 'number', description: 'Ticket ID' } },
+      required: ['ticketId']
+    }
+  },
+  {
+    name: 'create_ticket',
+    description: 'Create a new ticket. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        boardId: { type: 'number', description: 'Ticket board ID' },
+        subject: { type: 'string', description: 'Ticket subject' },
+        description: { type: 'string', description: 'Ticket description' },
+        status: { type: 'string', description: 'Ticket status (default: OPEN)' },
+        priority: { type: 'string', description: 'Priority (HIGH, MEDIUM, LOW)' },
+        severity: { type: 'string', description: 'Severity level' },
+        deviceId: { type: 'number', description: 'Associated device ID' },
+        assignedAppUserId: { type: 'number', description: 'Assigned technician user ID' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['boardId', 'subject']
+    }
+  },
+  {
+    name: 'update_ticket',
+    description: 'Update an existing ticket. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ticketId: { type: 'number', description: 'Ticket ID' },
+        subject: { type: 'string', description: 'Ticket subject' },
+        description: { type: 'string', description: 'Ticket description' },
+        status: { type: 'string', description: 'Ticket status' },
+        priority: { type: 'string', description: 'Priority' },
+        severity: { type: 'string', description: 'Severity' },
+        assignedAppUserId: { type: 'number', description: 'Assigned technician user ID' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['ticketId']
+    }
+  },
+  {
+    name: 'add_ticket_comment',
+    description: 'Add a comment/note to a ticket. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ticketId: { type: 'number', description: 'Ticket ID' },
+        comment: { type: 'string', description: 'Comment text' },
+        appUserId: { type: 'number', description: 'App user ID posting the comment' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['ticketId', 'comment']
+    }
+  },
+
+  // Phase 3 — Webhooks & event-driven
+
+  {
+    name: 'get_webhook_config',
+    description: 'Show the current NinjaOne webhook configuration',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'set_webhook_config',
+    description: 'Configure a webhook endpoint for NinjaOne events. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        webhookUrl: { type: 'string', description: 'Webhook URL to receive events' },
+        secret: { type: 'string', description: 'Shared secret for webhook verification' },
+        activities: { type: 'array', items: { type: 'string' }, description: 'Activity types to subscribe to' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['webhookUrl']
+    }
+  },
+  {
+    name: 'delete_webhook_config',
+    description: 'Remove the webhook configuration. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      }
+    }
+  },
+  {
+    name: 'get_stale_devices',
+    description: 'List devices that have not checked in for more than N hours',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sinceHours: { type: 'number', description: 'Hours since last check-in (default: 48)' }
+      }
+    }
+  },
+  {
+    name: 'get_devices_pending_patches',
+    description: 'List devices with pending or failed OS patches across the fleet',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['PENDING', 'FAILED'], description: 'Patch status filter (default: PENDING)' }
+      }
+    }
+  },
+  {
+    name: 'get_activities',
+    description: 'Query the NinjaOne system-wide activity log',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pageSize: { type: 'number', description: 'Results per page (default: 50)' },
+        after: { type: 'number', description: 'Pagination cursor (activity ID)' },
+        type: { type: 'string', description: 'Activity type filter' },
+        deviceId: { type: 'number', description: 'Filter by device ID' },
+        userId: { type: 'number', description: 'Filter by user ID' },
+        status: { type: 'string', description: 'Filter by status' }
+      }
+    }
+  },
+
+  // Phase 4 — Script execution & policy management
+
+  {
+    name: 'list_automations',
+    description: 'List all saved automation scripts/tasks in NinjaOne',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'run_device_script',
+    description: 'Execute a saved automation script on a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceId: { type: 'number', description: 'Device ID' },
+        scriptId: { type: 'number', description: 'Script/automation ID from NinjaOne' },
+        runAs: { type: 'string', description: 'Execution context (default: SYSTEM)' },
+        parameters: { type: 'string', description: 'Script parameters string' },
+        timeout: { type: 'number', description: 'Timeout in seconds (default: 300)' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['deviceId', 'scriptId']
+    }
+  },
+  {
+    name: 'get_script_result',
+    description: 'Poll the result of a previously triggered script run',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceId: { type: 'number', description: 'Device ID' },
+        activityId: { type: 'number', description: 'Activity ID from the script run' }
+      },
+      required: ['deviceId', 'activityId']
+    }
+  },
+  {
+    name: 'get_policy',
+    description: 'Get full detail for a specific policy',
+    inputSchema: {
+      type: 'object',
+      properties: { policyId: { type: 'number', description: 'Policy ID' } },
+      required: ['policyId']
+    }
+  },
+  {
+    name: 'assign_device_policy',
+    description: 'Assign a policy to a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceId: { type: 'number', description: 'Device ID' },
+        policyId: { type: 'number', description: 'Policy ID to assign' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['deviceId', 'policyId']
+    }
+  },
+  {
+    name: 'get_pending_devices',
+    description: 'List all devices awaiting approval',
+    inputSchema: { type: 'object', properties: {} }
+  }
+];
+
+/**
+ * NinjaONE MCP Server Class with multiple transports
+ */
+class NinjaOneMCPServer {
+  private server: Server;
+  private api: NinjaOneAPI;
+
+  constructor() {
+    try {
+      this.api = new NinjaOneAPI();
+      this.server = new Server(
+        {
+          name: 'ninjaone-mcp-server',
+          version: '1.2.0',
+        },
+        {
+          capabilities: {
+            tools: {}
+          }
+        }
+      );
+      this.setupToolHandlers();
+    } catch (error) {
+      console.error('Failed to initialize NinjaONE MCP Server:', error);
+      throw error;
+    }
+  }
+
+  private setupToolHandlers() {
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: TOOLS
+    }));
+
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      try {
+        console.error(`Executing tool: ${name}`);
+        const result = await this.routeToolCall(name, args || {});
+        return result;
+      } catch (error) {
+        if (error instanceof McpError) {
+          throw error;
+        }
+        throw new McpError(
+          ErrorCode.InternalError, 
+          `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    });
+  }
+
+  private dryRun(message: string) {
+    return {
+      content: [{
+        type: 'text',
+        text: `DRY RUN — no changes made.\n${message}\nRe-call with confirm=true to execute.`
+      }]
+    };
+  }
+
+  private result(data: any) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      }]
+    };
+  }
+
+  private async routeToolCall(name: string, args: any) {
+    try {
+      switch (name) {
+        // ── Device Management (read) ──
+        case 'get_devices':
+          return this.result(await this.api.getDevices(args.df, args.pageSize || 50, args.after));
+        case 'get_device':
+          return this.result(await this.api.getDevice(args.id));
+        case 'get_device_dashboard_url':
+          return this.result(await this.api.getDeviceDashboardUrl(args.id));
+        case 'get_device_software':
+          return this.result(await this.api.getDeviceSoftware(args.id));
+        case 'get_device_activities':
+          return this.result(await this.api.getDeviceActivities(args.id, args.pageSize));
+        case 'search_devices_by_name':
+          return this.result(await this.searchDevicesByName(args.name, args.limit || 10));
+        case 'find_windows11_devices':
+          return this.result(await this.findWindows11Devices(args.limit || 20));
+
+        // ── Device Management (write — confirm guarded) ──
+        case 'reboot_device': {
+          const mode = args.mode || 'NORMAL';
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            return this.dryRun(`Would reboot device id=${args.id} (${device.systemName || device.displayName || 'unknown'}) in ${mode} mode.`);
+          }
+          return this.result(await this.api.rebootDevice(args.id, mode));
+        }
+        case 'set_device_maintenance': {
+          if (typeof args.id !== 'number') {
+            throw new McpError(ErrorCode.InvalidParams, 'Device ID must be a number');
+          }
+          if (args.mode !== 'ON' && args.mode !== 'OFF') {
+            throw new McpError(ErrorCode.InvalidParams, 'Maintenance mode must be ON or OFF');
+          }
+
+          let durationSelection: MaintenanceWindowSelection | undefined;
+          if (args.mode === 'ON') {
+            if (args.duration === null || args.duration === undefined || typeof args.duration !== 'object') {
+              throw new McpError(ErrorCode.InvalidParams, 'Duration details are required when enabling maintenance mode');
+            }
+            const duration = args.duration;
+            const permanent = duration.permanent === true;
+            if (permanent) {
+              durationSelection = { permanent: true };
+            } else {
+              const value = duration.value;
+              const unitRaw = duration.unit;
+              if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+                throw new McpError(ErrorCode.InvalidParams, 'Duration value must be a positive number');
+              }
+              const unit = typeof unitRaw === 'string' ? unitRaw.toUpperCase() : '';
+              if (!Object.prototype.hasOwnProperty.call(MAINTENANCE_UNIT_SECONDS, unit)) {
+                throw new McpError(ErrorCode.InvalidParams, 'Duration unit must be one of MINUTES, HOURS, DAYS, or WEEKS');
+              }
+              const seconds = Math.round(value * MAINTENANCE_UNIT_SECONDS[unit as MaintenanceUnit]);
+              if (seconds < 15 * 60) {
+                throw new McpError(ErrorCode.InvalidParams, 'Maintenance windows must be at least 15 minutes long');
+              }
+              durationSelection = { permanent: false, value, unit: unit as MaintenanceUnit, seconds };
+            }
+          }
+
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const desc = args.mode === 'OFF'
+              ? `Would disable maintenance mode on device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).`
+              : durationSelection?.permanent
+                ? `Would enable PERMANENT maintenance mode on device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).`
+                : `Would enable maintenance mode on device id=${args.id} (${device.systemName || device.displayName || 'unknown'}) for ${(durationSelection as any)?.value} ${(durationSelection as any)?.unit}.`;
+            return this.dryRun(desc);
+          }
+          return this.result(await this.api.setDeviceMaintenance(args.id, args.mode, durationSelection));
+        }
+        case 'update_device': {
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const changes: string[] = [];
+            if (args.displayName) changes.push(`displayName → "${args.displayName}"`);
+            if (args.userData) changes.push(`userData → ${JSON.stringify(args.userData)}`);
+            return this.dryRun(`Would update device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).\nChanges: ${changes.join(', ') || 'none specified'}`);
+          }
+          const body: any = {};
+          if (args.displayName !== undefined) body.displayName = args.displayName;
+          if (args.userData !== undefined) body.userData = args.userData;
+          return this.result(await this.api.updateDevice(args.id, body));
+        }
+
+        // ── Alerts ──
+        case 'get_alerts':
+          return this.result(await this.api.getAlerts(undefined, args.since));
+        case 'get_alert':
+          return this.result(await this.api.getAlert(args.uid));
+        case 'get_device_alerts':
+          return this.result(await this.api.getDeviceAlerts(args.id, args.lang));
+        case 'reset_alert': {
+          if (!args.confirm) {
+            const alert = await this.api.getAlert(args.uid);
+            const desc = alert.message || alert.subject || 'unknown';
+            const devId = alert.deviceId || 'unknown';
+            return this.dryRun(`Would reset alert uid=${args.uid} (${desc}) on device id=${devId}.`);
+          }
+          return this.result(await this.api.resetAlert(args.uid));
+        }
+
+        // ── Organizations ──
+        case 'get_organizations':
+          return this.result(await this.api.getOrganizations(args.pageSize, args.after));
+        case 'get_organization':
+          return this.result(await this.api.getOrganization(args.id));
+        case 'get_organization_locations':
+          return this.result(await this.api.getOrganizationLocations(args.id));
+        case 'get_organization_policies':
+          return this.result(await this.api.getOrganizationPolicies(args.id));
+        case 'generate_organization_installer':
+          return this.result(await this.api.generateOrganizationInstaller(args.installerType, args.locationId, args.organizationId));
+        case 'create_organization':
+          return this.result(await this.api.createOrganization(args.name, args.description, args.nodeApprovalMode, args.tags));
+        case 'update_organization':
+          return this.result(await this.api.updateOrganization(args.id, args.name, args.description, undefined, args.tags));
+
+        // ── Locations ──
+        case 'create_location':
+          return this.result(await this.api.createLocation(args.organizationId, args.name, args.address, args.description));
+        case 'update_location':
+          return this.result(await this.api.updateLocation(args.organizationId, args.locationId, args.name, args.address, args.description));
+
+        // ── Region utilities ──
+        case 'list_regions':
+          return this.result(this.api.listRegions());
+        case 'set_region':
+          if (args.baseUrl) this.api.setBaseUrl(args.baseUrl);
+          else if (args.region) this.api.setRegion(args.region);
+          else throw new McpError(ErrorCode.InvalidParams, 'Provide either region or baseUrl');
+          return this.result({ ok: true });
+
+        // ── Device Control ──
+        case 'control_windows_service':
+          return this.result(await this.api.controlWindowsService(args.id, args.serviceId, args.action));
+        case 'configure_windows_service':
+          return this.result(await this.api.configureWindowsService(args.id, args.serviceId, args.startupType));
+
+        // ── Patching ──
+        case 'scan_device_os_patches':
+          return this.result(await this.api.scanDeviceOSPatches(args.id));
+        case 'scan_device_software_patches':
+          return this.result(await this.api.scanDeviceSoftwarePatches(args.id));
+        case 'apply_device_os_patches': {
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const patchList = (args.patches || []).map((p: any) => p.id || JSON.stringify(p)).join(', ');
+            return this.dryRun(`Would apply ${args.patches?.length || 0} OS patch(es) to device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).\nPatches: ${patchList}`);
+          }
+          return this.result(await this.api.applyDeviceOSPatches(args.id, args.patches));
+        }
+        case 'apply_device_software_patches': {
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const patchList = (args.patches || []).map((p: any) => p.id || JSON.stringify(p)).join(', ');
+            return this.dryRun(`Would apply ${args.patches?.length || 0} software patch(es) to device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).\nPatches: ${patchList}`);
+          }
+          return this.result(await this.api.applyDeviceSoftwarePatches(args.id, args.patches));
+        }
+
+        // ── Users & Roles ──
+        case 'get_end_users':
+          return this.result(await this.api.getEndUsers());
+        case 'get_end_user':
+          return this.result(await this.api.getEndUser(args.id));
+        case 'create_end_user':
+          return this.result(await this.api.createEndUser(
+            { firstName: args.firstName, lastName: args.lastName, email: args.email, phone: args.phone, organizationId: args.organizationId, fullPortalAccess: args.fullPortalAccess },
+            args.sendInvitation
+          ));
+        case 'update_end_user':
+          return this.result(await this.api.updateEndUser(args.id, args.firstName, args.lastName, args.email, args.phone));
+        case 'delete_end_user':
+          return this.result(await this.api.deleteEndUser(args.id));
+        case 'get_technicians':
+          return this.result(await this.api.getTechnicians());
+        case 'get_technician':
+          return this.result(await this.api.getTechnician(args.id));
+        case 'add_role_members':
+          return this.result(await this.api.addRoleMembers(args.roleId, args.userIds));
+        case 'remove_role_members':
+          return this.result(await this.api.removeRoleMembers(args.roleId, args.userIds));
+
+        // ── Contacts ──
+        case 'get_contacts':
+          return this.result(await this.api.getContacts());
+        case 'get_contact':
+          return this.result(await this.api.getContact(args.id));
+        case 'create_contact':
+          return this.result(await this.api.createContact(args.organizationId, args.firstName, args.lastName, args.email, args.phone, args.jobTitle));
+        case 'update_contact':
+          return this.result(await this.api.updateContact(args.id, args.firstName, args.lastName, args.email, args.phone, args.jobTitle));
+        case 'delete_contact':
+          return this.result(await this.api.deleteContact(args.id));
+
+        // ── Device approvals & policy ──
+        case 'approve_devices': {
+          if (!args.confirm) {
+            return this.dryRun(`Would ${args.mode} ${args.deviceIds.length} device(s): [${args.deviceIds.join(', ')}].`);
+          }
+          return this.result(await this.api.approveDevices(args.mode, args.deviceIds));
+        }
+        case 'get_device_policy_overrides':
+          return this.result(await this.api.getDevicePolicyOverrides(args.id));
+        case 'reset_device_policy_overrides': {
+          if (!args.confirm) {
+            const overrides = await this.api.getDevicePolicyOverrides(args.id);
+            return this.dryRun(`Would reset all policy overrides on device id=${args.id}.\nCurrent overrides: ${JSON.stringify(overrides, null, 2)}`);
+          }
+          return this.result(await this.api.resetDevicePolicyOverrides(args.id));
+        }
+        case 'get_policies':
+          return this.result(await this.api.getPolicies(args.templateOnly));
+
+        // ── System Information Queries ──
+        case 'query_antivirus_status':
+          return this.result(await this.api.queryAntivirusStatus(args.df, args.cursor, args.pageSize || 50));
+        case 'query_antivirus_threats':
+          return this.result(await this.api.queryAntivirusThreats(args.df, args.cursor, args.pageSize || 50));
+        case 'query_computer_systems':
+          return this.result(await this.api.queryComputerSystems(args.df, args.cursor, args.pageSize || 50));
+        case 'query_device_health':
+          return this.result(await this.api.queryDeviceHealth(args.df, args.cursor, args.pageSize || 50));
+        case 'query_operating_systems':
+          return this.result(await this.api.queryOperatingSystems(args.df, args.cursor, args.pageSize || 50));
+        case 'query_logged_on_users':
+          return this.result(await this.api.queryLoggedOnUsers(args.df, args.cursor, args.pageSize || 50));
+
+        // ── Hardware Queries ──
+        case 'query_processors':
+          return this.result(await this.api.queryProcessors(args.df, args.cursor, args.pageSize || 50));
+        case 'query_disks':
+          return this.result(await this.api.queryDisks(args.df, args.cursor, args.pageSize || 50));
+        case 'query_volumes':
+          return this.result(await this.api.queryVolumes(args.df, args.cursor, args.pageSize || 50));
+        case 'query_network_interfaces':
+          return this.result(await this.api.queryNetworkInterfaces(args.df, args.cursor, args.pageSize || 50));
+        case 'query_raid_controllers':
+          return this.result(await this.api.queryRaidControllers(args.df, args.cursor, args.pageSize || 50));
+        case 'query_raid_drives':
+          return this.result(await this.api.queryRaidDrives(args.df, args.cursor, args.pageSize || 50));
+
+        // ── Software & Patch Queries ──
+        case 'query_software':
+          return this.result(await this.api.querySoftware(args.df, args.cursor, args.pageSize || 50));
+        case 'query_os_patches':
+          return this.result(await this.api.queryOSPatches(args.df, args.cursor, args.pageSize || 50));
+        case 'query_software_patches':
+          return this.result(await this.api.querySoftwarePatches(args.df, args.cursor, args.pageSize || 50));
+        case 'query_os_patch_installs':
+          return this.result(await this.api.queryOSPatchInstalls(args.df, args.cursor, args.pageSize || 50));
+        case 'query_software_patch_installs':
+          return this.result(await this.api.querySoftwarePatchInstalls(args.df, args.cursor, args.pageSize || 50));
+        case 'query_windows_services':
+          return this.result(await this.api.queryWindowsServices(args.df, args.cursor, args.pageSize || 50));
+
+        // ── Custom Fields & Policy Queries ──
+        case 'query_custom_fields':
+          return this.result(await this.api.queryCustomFields(args.df, args.cursor, args.pageSize || 50));
+        case 'query_custom_fields_detailed':
+          return this.result(await this.api.queryCustomFieldsDetailed(args.df, args.cursor, args.pageSize || 50));
+        case 'query_scoped_custom_fields':
+          return this.result(await this.api.queryScopedCustomFields(args.df, args.cursor, args.pageSize || 50));
+        case 'query_scoped_custom_fields_detailed':
+          return this.result(await this.api.queryScopedCustomFieldsDetailed(args.df, args.cursor, args.pageSize || 50));
+        case 'query_policy_overrides':
+          return this.result(await this.api.queryPolicyOverrides(args.df, args.cursor, args.pageSize || 50));
+
+        // ── Backup ──
+        case 'query_backup_usage':
+          return this.result(await this.api.queryBackupUsage(args.df, args.cursor, args.pageSize || 50));
+
+        // ── Auto-paginating search tools ──
+        case 'search_software':
+          return this.result(await this.api.queryAllFiltered('/v2/queries/software', {
+            df: args.df,
+            filter: { text: args.name, fields: ['name', 'publisher'] },
+            maxResults: args.maxResults || 500
+          }));
+        case 'search_os_patches':
+          return this.result(await this.api.queryAllFiltered('/v2/queries/os-patches', {
+            df: args.df,
+            filter: { text: args.name, fields: ['name', 'kbNumber'] },
+            maxResults: args.maxResults || 500
+          }));
+        case 'search_windows_services':
+          return this.result(await this.api.queryAllFiltered('/v2/queries/windows-services', {
+            df: args.df,
+            filter: { text: args.name, fields: ['name', 'displayName'] },
+            maxResults: args.maxResults || 500
+          }));
+
+        // ── Phase 2: Custom field writes ──
+        case 'update_device_custom_fields': {
+          if (!args.confirm) {
+            return this.dryRun(`Would update custom fields on device id=${args.deviceId}.\nFields: ${JSON.stringify(args.fields, null, 2)}`);
+          }
+          return this.result(await this.api.updateDeviceCustomFields(args.deviceId, args.fields));
+        }
+        case 'update_org_custom_fields': {
+          if (!args.confirm) {
+            return this.dryRun(`Would update custom fields on organization id=${args.orgId}.\nFields: ${JSON.stringify(args.fields, null, 2)}`);
+          }
+          return this.result(await this.api.updateOrganizationCustomFields(args.orgId, args.fields));
+        }
+
+        // ── Phase 2: Ticketing ──
+        case 'get_ticket_boards':
+          return this.result(await this.api.getTicketBoards());
+        case 'get_tickets':
+          return this.result(await this.api.getTickets(args.boardId, args.pageSize || 25, args.after));
+        case 'get_ticket':
+          return this.result(await this.api.getTicket(args.ticketId));
+        case 'get_ticket_log':
+          return this.result(await this.api.getTicketLog(args.ticketId));
+        case 'create_ticket': {
+          if (!args.confirm) {
+            return this.dryRun(`Would create ticket on board id=${args.boardId}.\nSubject: "${args.subject}"\nStatus: ${args.status || 'OPEN'}\nPriority: ${args.priority || 'not set'}\nDevice: ${args.deviceId || 'none'}`);
+          }
+          const body: any = { boardId: args.boardId, subject: args.subject, status: args.status || 'OPEN' };
+          if (args.description !== undefined) body.description = args.description;
+          if (args.priority !== undefined) body.priority = args.priority;
+          if (args.severity !== undefined) body.severity = args.severity;
+          if (args.type !== undefined) body.type = args.type;
+          if (args.assignedAppUserId !== undefined) body.assignedAppUserId = args.assignedAppUserId;
+          if (args.deviceId !== undefined) body.deviceId = args.deviceId;
+          return this.result(await this.api.createTicket(body));
+        }
+        case 'update_ticket': {
+          if (!args.confirm) {
+            const changes: string[] = [];
+            if (args.subject) changes.push(`subject → "${args.subject}"`);
+            if (args.status) changes.push(`status → "${args.status}"`);
+            if (args.priority) changes.push(`priority → "${args.priority}"`);
+            if (args.severity) changes.push(`severity → "${args.severity}"`);
+            if (args.description) changes.push(`description updated`);
+            if (args.assignedAppUserId) changes.push(`assignedAppUserId → ${args.assignedAppUserId}`);
+            return this.dryRun(`Would update ticket id=${args.ticketId}.\nChanges: ${changes.join(', ') || 'none specified'}`);
+          }
+          const body: any = {};
+          if (args.subject !== undefined) body.subject = args.subject;
+          if (args.description !== undefined) body.description = args.description;
+          if (args.status !== undefined) body.status = args.status;
+          if (args.priority !== undefined) body.priority = args.priority;
+          if (args.severity !== undefined) body.severity = args.severity;
+          if (args.assignedAppUserId !== undefined) body.assignedAppUserId = args.assignedAppUserId;
+          return this.result(await this.api.updateTicket(args.ticketId, body));
+        }
+        case 'add_ticket_comment': {
+          if (!args.confirm) {
+            return this.dryRun(`Would add comment to ticket id=${args.ticketId}.\nComment: "${args.comment}"`);
+          }
+          return this.result(await this.api.addTicketComment(args.ticketId, args.comment, args.appUserId));
+        }
+
+        // ── Phase 3: Webhooks ──
+        case 'get_webhook_config':
+          return this.result(await this.api.getWebhookConfig());
+        case 'set_webhook_config': {
+          if (!args.confirm) {
+            return this.dryRun(`Would configure webhook.\nURL: ${args.webhookUrl}\nActivities: ${args.activities ? args.activities.join(', ') : 'all'}`);
+          }
+          const body: any = { webhookUrl: args.webhookUrl };
+          if (args.secret !== undefined) body.secret = args.secret;
+          if (args.activities !== undefined) body.activities = args.activities;
+          return this.result(await this.api.setWebhookConfig(body));
+        }
+        case 'delete_webhook_config': {
+          if (!args.confirm) {
+            return this.dryRun(`Would delete the current webhook configuration.`);
+          }
+          return this.result(await this.api.deleteWebhookConfig());
+        }
+
+        // ── Phase 3: Polling queries ──
+        case 'get_stale_devices':
+          return this.result(await this.api.getStaleDevices(args.sinceHours || 48));
+        case 'get_devices_pending_patches':
+          return this.result(await this.api.getDevicesWithPendingPatches(args.status || 'PENDING'));
+        case 'get_activities':
+          return this.result(await this.api.getActivities({
+            pageSize: args.pageSize || 50,
+            after: args.after,
+            type: args.type,
+            deviceId: args.deviceId,
+            userId: args.userId,
+            status: args.status
+          }));
+
+        // ── Phase 4: Script execution ──
+        case 'list_automations':
+          return this.result(await this.api.getAutomations());
+        case 'run_device_script': {
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.deviceId);
+            return this.dryRun(`Would run script id=${args.scriptId} on device id=${args.deviceId} (${device.systemName || device.displayName || 'unknown'}).\nRun as: ${args.runAs || 'SYSTEM'}\nParameters: ${args.parameters || 'none'}\nTimeout: ${args.timeout || 300}s`);
+          }
+          return this.result(await this.api.runDeviceScript(args.deviceId, {
+            id: args.scriptId,
+            runAs: args.runAs || 'SYSTEM',
+            parameters: args.parameters,
+            timeout: args.timeout || 300
+          }));
+        }
+        case 'get_script_result':
+          return this.result(await this.api.getScriptResult(args.deviceId, args.activityId));
+
+        // ── Phase 4: Policy management ──
+        case 'get_policy':
+          return this.result(await this.api.getPolicy(args.policyId));
+        case 'assign_device_policy': {
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.deviceId);
+            return this.dryRun(`Would assign policy id=${args.policyId} to device id=${args.deviceId} (${device.systemName || device.displayName || 'unknown'}).`);
+          }
+          return this.result(await this.api.assignDevicePolicy(args.deviceId, args.policyId));
+        }
+
+        // ── Phase 4: Device approval ──
+        case 'get_pending_devices':
+          return this.result(await this.api.getPendingDevices());
+
+        default:
+          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
+    } catch (error) {
+      if (error instanceof McpError) throw error;
+      throw new McpError(
+        ErrorCode.InternalError,
+        `API call failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async searchDevicesByName(searchName: string, limit: number) {
+    const devices = await this.api.getDevices(undefined, 200);
+    const filtered = devices
+      .filter((device: any) => 
+        device.systemName?.toLowerCase().includes(searchName.toLowerCase()) ||
+        device.displayName?.toLowerCase().includes(searchName.toLowerCase())
+      )
+      .slice(0, limit);
+    
+    return {
+      searchTerm: searchName,
+      totalFound: filtered.length,
+      devices: filtered
+    };
+  }
+
+  private async findWindows11Devices(limit: number) {
+    const devices = await this.api.getDevices(undefined, 200);
+    const windowsDevices = devices.filter((device: any) => 
+      device.nodeClass === 'WINDOWS_WORKSTATION' || device.nodeClass === 'WINDOWS_SERVER'
+    );
+
+    const windows11Devices = [];
+    for (const device of windowsDevices.slice(0, 50)) {
+      try {
+        const details = await this.api.getDevice(device.id);
+        if (details.os?.name?.includes('Windows 11')) {
+          windows11Devices.push({
+            id: device.id,
+            systemName: device.systemName,
+            displayName: device.displayName,
+            offline: device.offline,
+            osName: details.os.name,
+            buildNumber: details.os.buildNumber,
+            releaseId: details.os.releaseId,
+            manufacturer: details.system?.manufacturer,
+            model: details.system?.model
+          });
+          
+          if (windows11Devices.length >= limit) break;
+        }
+      } catch (error) {
+        continue;
+      }
+    }
+
+    return {
+      totalFound: windows11Devices.length,
+      devices: windows11Devices
+    };
+  }
+
+  async runStdio() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.error('NinjaONE MCP server running on STDIO transport');
+  }
+
+  async runHttp(port = 3000) {
+    await createHttpServer(this.server, port);
+    console.error(`NinjaONE MCP server running on HTTP transport at port ${port}`);
+  }
+
+  async runSse(port = 3001) {
+    await createSseServer(this.server, port);
+    console.error(`NinjaONE MCP server running on SSE transport at port ${port}`);
+  }
+}
+
+/**
+ * Main entry point with transport selection
+ */
+async function main() {
+  const mode = process.env.MCP_MODE || 'stdio';
+  const server = new NinjaOneMCPServer();
+
+  try {
+    switch (mode.toLowerCase()) {
+      case 'http':
+        const httpPort = parseInt(process.env.HTTP_PORT || '3000', 10);
+        await server.runHttp(httpPort);
+        break;
+      case 'sse':
+        const ssePort = parseInt(process.env.SSE_PORT || '3001', 10);
+        await server.runSse(ssePort);
+        break;
+      case 'stdio':
+      default:
+        await server.runStdio();
+        break;
+    }
+  } catch (error) {
+    console.error('Server startup failed:', error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.error('Received SIGINT, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.error('Received SIGTERM, shutting down gracefully...');
+  process.exit(0);
+});
+
+// Start the server
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
