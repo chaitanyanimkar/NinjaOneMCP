@@ -344,8 +344,15 @@ export class NinjaOneAPI {
     return this.makeRequest(`/v2/organization/${id}/locations`); 
   }
 
-  async getOrganizationPolicies(id: number): Promise<any> { 
-    return this.makeRequest(`/v2/organization/${id}/policies`); 
+  async getOrganizationPolicies(id: number): Promise<any> {
+    // NinjaOne has no GET /v2/organization/{id}/policies — only PUT exists.
+    // Return all policies; the caller can cross-reference with org devices.
+    const policies = await this.getPolicies();
+    return {
+      note: `NinjaOne does not expose per-organization policy assignments via GET. Returning all policies. Use get_device or get_policy to see which policy a specific device or org uses.`,
+      organizationId: id,
+      policies
+    };
   }
 
   async generateOrganizationInstaller(installerType: string, locationId?: number, organizationId?: number): Promise<any> {
@@ -885,6 +892,6 @@ export class NinjaOneAPI {
   }
 
   async getPendingDevices(): Promise<any> {
-    return this.getDevices('approval_status = PENDING', 200);
+    return this.getDevices('status = PENDING', 200);
   }
 }
