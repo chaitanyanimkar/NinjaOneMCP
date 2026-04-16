@@ -868,7 +868,7 @@ const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Software name to search for (case-insensitive partial match)' },
         df: { type: 'string', description: 'Device filter (e.g., "org = 1")' },
-        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 50)' }
       },
       required: ['name']
     }
@@ -881,7 +881,7 @@ const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Patch name/KB to search for (case-insensitive partial match)' },
         df: { type: 'string', description: 'Device filter' },
-        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 50)' }
       },
       required: ['name']
     }
@@ -894,7 +894,7 @@ const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Service name to search for (case-insensitive partial match)' },
         df: { type: 'string', description: 'Device filter' },
-        maxResults: { type: 'number', description: 'Maximum results to return (default: 500)' }
+        maxResults: { type: 'number', description: 'Maximum results to return (default: 50)' }
       },
       required: ['name']
     }
@@ -1224,10 +1224,20 @@ class NinjaOneMCPServer {
   }
 
   private result(data: any) {
+    // Use compact JSON to minimise token consumption in Claude Desktop.
+    // For array responses, prepend a count so the model knows the size at a glance.
+    let text: string;
+    if (Array.isArray(data)) {
+      text = `{"count":${data.length},"results":${JSON.stringify(data)}}`;
+    } else if (data?.results && Array.isArray(data.results)) {
+      text = JSON.stringify({ ...data, count: data.results.length });
+    } else {
+      text = JSON.stringify(data);
+    }
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify(data, null, 2)
+        text
       }]
     };
   }
@@ -1513,19 +1523,19 @@ class NinjaOneMCPServer {
           return this.result(await this.api.queryAllFiltered('/v2/queries/software', {
             df: args.df,
             filter: { text: args.name, fields: ['name', 'publisher'] },
-            maxResults: args.maxResults || 500
+            maxResults: args.maxResults || 50
           }));
         case 'search_os_patches':
           return this.result(await this.api.queryAllFiltered('/v2/queries/os-patches', {
             df: args.df,
             filter: { text: args.name, fields: ['name', 'kbNumber'] },
-            maxResults: args.maxResults || 500
+            maxResults: args.maxResults || 50
           }));
         case 'search_windows_services':
           return this.result(await this.api.queryAllFiltered('/v2/queries/windows-services', {
             df: args.df,
             filter: { text: args.name, fields: ['name', 'displayName'] },
-            maxResults: args.maxResults || 500
+            maxResults: args.maxResults || 50
           }));
 
         // ── Phase 2: Custom field writes ──
@@ -1673,12 +1683,21 @@ class NinjaOneMCPServer {
   private async searchDevicesByName(searchName: string, limit: number) {
     const devices = await this.api.getDevices(undefined, 200);
     const filtered = devices
-      .filter((device: any) => 
+      .filter((device: any) =>
         device.systemName?.toLowerCase().includes(searchName.toLowerCase()) ||
         device.displayName?.toLowerCase().includes(searchName.toLowerCase())
       )
-      .slice(0, limit);
-    
+      .slice(0, limit)
+      .map((d: any) => ({
+        id: d.id,
+        systemName: d.systemName,
+        displayName: d.displayName,
+        nodeClass: d.nodeClass,
+        offline: d.offline,
+        organizationId: d.organizationId,
+        lastContact: d.lastContact
+      }));
+
     return {
       searchTerm: searchName,
       totalFound: filtered.length,
@@ -1687,34 +1706,20 @@ class NinjaOneMCPServer {
   }
 
   private async findWindows11Devices(limit: number) {
-    const devices = await this.api.getDevices(undefined, 200);
-    const windowsDevices = devices.filter((device: any) => 
-      device.nodeClass === 'WINDOWS_WORKSTATION' || device.nodeClass === 'WINDOWS_SERVER'
-    );
-
-    const windows11Devices = [];
-    for (const device of windowsDevices.slice(0, 50)) {
-      try {
-        const details = await this.api.getDevice(device.id);
-        if (details.os?.name?.includes('Windows 11')) {
-          windows11Devices.push({
-            id: device.id,
-            systemName: device.systemName,
-            displayName: device.displayName,
-            offline: device.offline,
-            osName: details.os.name,
-            buildNumber: details.os.buildNumber,
-            releaseId: details.os.releaseId,
-            manufacturer: details.system?.manufacturer,
-            model: details.system?.model
-          });
-          
-          if (windows11Devices.length >= limit) break;
-        }
-      } catch (error) {
-        continue;
-      }
-    }
+    // Use the OS query endpoint to find Windows 11 in one call instead of N+1 device lookups
+    const osData = await this.api.queryOperatingSystems(undefined, undefined, 500);
+    const results: any[] = osData?.results || [];
+    const windows11Devices = results
+      .filter((r: any) => r.name?.includes('Windows 11'))
+      .slice(0, limit)
+      .map((r: any) => ({
+        deviceId: r.deviceId,
+        name: r.name,
+        buildNumber: r.buildNumber,
+        releaseId: r.releaseId,
+        architecture: r.architecture,
+        lastReboot: r.lastReboot
+      }));
 
     return {
       totalFound: windows11Devices.length,

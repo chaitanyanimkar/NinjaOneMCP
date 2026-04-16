@@ -555,12 +555,12 @@ export class NinjaOneAPI {
       maxResults?: number;
     }
   ): Promise<any[]> {
-    const maxResults = opts?.maxResults || 500;
+    const maxResults = opts?.maxResults || 50;
     const filterText = opts?.filter?.text?.toLowerCase();
     const filterFields = opts?.filter?.fields || [];
     const collected: any[] = [];
     let cursor: string | undefined;
-    const pageSize = 10000;
+    const pageSize = 500;
 
     while (true) {
       const query = this.buildQuery({ df: opts?.df, cursor, pageSize });
@@ -806,17 +806,28 @@ export class NinjaOneAPI {
 
   async getStaleDevices(sinceHours: number): Promise<any> {
     const cutoff = new Date(Date.now() - sinceHours * 60 * 60 * 1000).toISOString();
-    const devices = await this.getDevices(undefined, 1000);
+    // NinjaOne df doesn't support last_contact, so filter client-side but keep response lean
+    const devices = await this.getDevices(undefined, 200);
     if (!Array.isArray(devices)) return [];
-    return devices.filter((d: any) => {
-      if (!d.lastContact) return true;
-      return new Date(d.lastContact).toISOString() < cutoff;
-    });
+    return devices
+      .filter((d: any) => {
+        if (!d.lastContact) return true;
+        return new Date(d.lastContact).toISOString() < cutoff;
+      })
+      .map((d: any) => ({
+        id: d.id,
+        systemName: d.systemName,
+        displayName: d.displayName,
+        nodeClass: d.nodeClass,
+        offline: d.offline,
+        lastContact: d.lastContact,
+        organizationId: d.organizationId
+      }));
   }
 
   async getDevicesWithPendingPatches(status?: string): Promise<any> {
     const patchStatus = status || 'PENDING';
-    return this.queryOSPatches(undefined, undefined, 1000);
+    return this.queryOSPatches(`status = ${patchStatus}`, undefined, 200);
   }
 
   async getActivities(params?: {
@@ -835,15 +846,21 @@ export class NinjaOneAPI {
   // Phase 4 — Script execution & policy management
 
   async getAutomations(): Promise<any> {
-    // Try known paths for automation scripts; the exact endpoint varies by API version.
-    try {
-      return await this.makeRequest('/v2/automation/scripting');
-    } catch (e: any) {
-      if (e.message?.includes('404') || e.message?.includes('405')) {
-        return { note: 'Automation script listing is not available via client credentials flow. Scripts must be pre-configured in NinjaOne; use run_device_script with a known script ID.' };
+    // Try known endpoint paths — the scripting API path varies by NinjaOne version.
+    const paths = [
+      '/v2/device-scripting/scripts',
+      '/v2/automation/scripting',
+      '/v2/scripting/automation'
+    ];
+    for (const path of paths) {
+      try {
+        return await this.makeRequest(path);
+      } catch (e: any) {
+        if (e.message?.includes('404') || e.message?.includes('405')) continue;
+        throw e;
       }
-      throw e;
     }
+    return { note: 'Automation script listing is not available via client credentials flow. Scripts must be pre-configured in NinjaOne; use run_device_script with a known script ID.' };
   }
 
   async runDeviceScript(deviceId: number, body: {
@@ -868,6 +885,6 @@ export class NinjaOneAPI {
   }
 
   async getPendingDevices(): Promise<any> {
-    return this.getDevices('approval_status = PENDING', 1000);
+    return this.getDevices('approval_status = PENDING', 200);
   }
 }
