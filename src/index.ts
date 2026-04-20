@@ -215,9 +215,9 @@ const TOOLS = [
       properties: {
         id: { type: 'number', description: 'Device ID' },
         serviceId: { type: 'string', description: 'Service ID' },
-        startupType: { type: 'string', description: 'Startup type (e.g., AUTOMATIC, MANUAL, DISABLED)' }
+        startType: { type: 'string', description: 'Startup type (e.g., AUTOMATIC, MANUAL, DISABLED)' }
       },
-      required: ['id', 'serviceId', 'startupType']
+      required: ['id', 'serviceId', 'startType']
     }
   },
   // Device Patching
@@ -304,11 +304,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        installerType: { type: 'string', description: 'Installer type (e.g., WINDOWS, MAC, LINUX)' },
-        organizationId: { type: 'number', description: 'Organization ID (optional if implied by auth)' },
-        locationId: { type: 'number', description: 'Location ID (optional)' }
+        organizationId: { type: 'number', description: 'Organization ID' },
+        locationId: { type: 'number', description: 'Location ID' },
+        installerType: { type: 'string', description: 'Installer type (e.g., WINDOWS_MSI, MAC_DMG, MAC_PKG, LINUX_DEB, LINUX_RPM)' }
       },
-      required: ['installerType']
+      required: ['organizationId', 'locationId', 'installerType']
     }
   },
   // Organization CRUD
@@ -986,32 +986,35 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        boardId: { type: 'number', description: 'Ticket board ID' },
-        subject: { type: 'string', description: 'Ticket subject' },
-        description: { type: 'string', description: 'Ticket description' },
-        status: { type: 'string', description: 'Ticket status (default: OPEN)' },
-        priority: { type: 'string', description: 'Priority (HIGH, MEDIUM, LOW)' },
-        severity: { type: 'string', description: 'Severity level' },
-        deviceId: { type: 'number', description: 'Associated device ID' },
+        clientId: { type: 'number', description: 'Organization (client) ID' },
+        ticketFormId: { type: 'number', description: 'Ticket form ID (default: 1)' },
+        summary: { type: 'string', description: 'Ticket summary (max 200 chars)' },
+        description: { type: 'string', description: 'Ticket description body text' },
+        status: { type: 'string', enum: ['NEW', 'OPEN', 'WAITING', 'PAUSED', 'RESOLVED', 'CLOSED'], description: 'Ticket status (default: NEW)' },
+        priority: { type: 'string', enum: ['NONE', 'LOW', 'MEDIUM', 'HIGH'], description: 'Priority' },
+        severity: { type: 'string', enum: ['NONE', 'MINOR', 'MODERATE', 'MAJOR', 'CRITICAL'], description: 'Severity' },
+        type: { type: 'string', enum: ['PROBLEM', 'QUESTION', 'INCIDENT', 'TASK'], description: 'Ticket type' },
+        nodeId: { type: 'number', description: 'Associated device (node) ID' },
         assignedAppUserId: { type: 'number', description: 'Assigned technician user ID' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
-      required: ['boardId', 'subject']
+      required: ['summary']
     }
   },
   {
     name: 'update_ticket',
-    description: 'Update an existing ticket. Set confirm=true to execute; default is dry-run.',
+    description: 'Update an existing ticket. Automatically fetches version/ticketFormId. Set confirm=true to execute; default is dry-run.',
     inputSchema: {
       type: 'object',
       properties: {
         ticketId: { type: 'number', description: 'Ticket ID' },
-        subject: { type: 'string', description: 'Ticket subject' },
-        description: { type: 'string', description: 'Ticket description' },
-        status: { type: 'string', description: 'Ticket status' },
-        priority: { type: 'string', description: 'Priority' },
-        severity: { type: 'string', description: 'Severity' },
+        summary: { type: 'string', description: 'Ticket summary (max 200 chars)' },
+        status: { type: 'string', enum: ['NEW', 'OPEN', 'WAITING', 'PAUSED', 'RESOLVED', 'CLOSED'], description: 'Ticket status' },
+        priority: { type: 'string', enum: ['NONE', 'LOW', 'MEDIUM', 'HIGH'], description: 'Priority' },
+        severity: { type: 'string', enum: ['NONE', 'MINOR', 'MODERATE', 'MAJOR', 'CRITICAL'], description: 'Severity' },
+        type: { type: 'string', enum: ['PROBLEM', 'QUESTION', 'INCIDENT', 'TASK'], description: 'Ticket type' },
         assignedAppUserId: { type: 'number', description: 'Assigned technician user ID' },
+        comment: { type: 'string', description: 'Optional comment to add with the update' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
       required: ['ticketId']
@@ -1045,12 +1048,13 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        webhookUrl: { type: 'string', description: 'Webhook URL to receive events' },
-        secret: { type: 'string', description: 'Shared secret for webhook verification' },
-        activities: { type: 'array', items: { type: 'string' }, description: 'Activity types to subscribe to' },
+        url: { type: 'string', description: 'Webhook URL to receive events' },
+        activities: { type: 'object', description: 'Map of activity categories to event type arrays (e.g., {"DEVICE": ["ADDED", "DELETED"]})' },
+        expand: { type: 'array', items: { type: 'string' }, description: 'Activity types to include expanded data for' },
+        headers: { type: 'object', description: 'Custom HTTP headers to send with webhook requests (use for auth/secrets)' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
-      required: ['webhookUrl']
+      required: ['url']
     }
   },
   {
@@ -1357,7 +1361,7 @@ class NinjaOneMCPServer {
         case 'get_organization_policies':
           return this.result(await this.api.getOrganizationPolicies(args.id));
         case 'generate_organization_installer':
-          return this.result(await this.api.generateOrganizationInstaller(args.installerType, args.locationId, args.organizationId));
+          return this.result(await this.api.generateOrganizationInstaller(args.organizationId, args.locationId, args.installerType));
         case 'create_organization':
           return this.result(await this.api.createOrganization(args.name, args.description, args.nodeApprovalMode, args.tags));
         case 'update_organization':
@@ -1382,7 +1386,7 @@ class NinjaOneMCPServer {
         case 'control_windows_service':
           return this.result(await this.api.controlWindowsService(args.id, args.serviceId, args.action));
         case 'configure_windows_service':
-          return this.result(await this.api.configureWindowsService(args.id, args.serviceId, args.startupType));
+          return this.result(await this.api.configureWindowsService(args.id, args.serviceId, args.startType));
 
         // ── Patching ──
         case 'scan_device_os_patches':
@@ -1563,36 +1567,43 @@ class NinjaOneMCPServer {
           return this.result(await this.api.getTicketLog(args.ticketId));
         case 'create_ticket': {
           if (!args.confirm) {
-            return this.dryRun(`Would create ticket on board id=${args.boardId}.\nSubject: "${args.subject}"\nStatus: ${args.status || 'OPEN'}\nPriority: ${args.priority || 'not set'}\nDevice: ${args.deviceId || 'none'}`);
+            return this.dryRun(`Would create ticket.\nSummary: "${args.summary}"\nStatus: ${args.status || 'NEW'}\nPriority: ${args.priority || 'not set'}\nDevice: ${args.nodeId || 'none'}`);
           }
-          const body: any = { boardId: args.boardId, subject: args.subject, status: args.status || 'OPEN' };
-          if (args.description !== undefined) body.description = args.description;
+          const body: any = {
+            summary: args.summary,
+            status: args.status || 'NEW',
+            ticketFormId: args.ticketFormId || 1
+          };
+          if (args.clientId !== undefined) body.clientId = args.clientId;
+          if (args.description !== undefined) body.description = { public: true, body: args.description };
           if (args.priority !== undefined) body.priority = args.priority;
           if (args.severity !== undefined) body.severity = args.severity;
           if (args.type !== undefined) body.type = args.type;
           if (args.assignedAppUserId !== undefined) body.assignedAppUserId = args.assignedAppUserId;
-          if (args.deviceId !== undefined) body.deviceId = args.deviceId;
+          if (args.nodeId !== undefined) body.nodeId = args.nodeId;
           return this.result(await this.api.createTicket(body));
         }
         case 'update_ticket': {
           if (!args.confirm) {
             const changes: string[] = [];
-            if (args.subject) changes.push(`subject → "${args.subject}"`);
+            if (args.summary) changes.push(`summary → "${args.summary}"`);
             if (args.status) changes.push(`status → "${args.status}"`);
             if (args.priority) changes.push(`priority → "${args.priority}"`);
             if (args.severity) changes.push(`severity → "${args.severity}"`);
-            if (args.description) changes.push(`description updated`);
+            if (args.type) changes.push(`type → "${args.type}"`);
             if (args.assignedAppUserId) changes.push(`assignedAppUserId → ${args.assignedAppUserId}`);
+            if (args.comment) changes.push(`comment: "${args.comment}"`);
             return this.dryRun(`Would update ticket id=${args.ticketId}.\nChanges: ${changes.join(', ') || 'none specified'}`);
           }
-          const body: any = {};
-          if (args.subject !== undefined) body.subject = args.subject;
-          if (args.description !== undefined) body.description = args.description;
-          if (args.status !== undefined) body.status = args.status;
-          if (args.priority !== undefined) body.priority = args.priority;
-          if (args.severity !== undefined) body.severity = args.severity;
-          if (args.assignedAppUserId !== undefined) body.assignedAppUserId = args.assignedAppUserId;
-          return this.result(await this.api.updateTicket(args.ticketId, body));
+          const ticketFields: any = {};
+          if (args.summary !== undefined) ticketFields.summary = args.summary;
+          if (args.status !== undefined) ticketFields.status = args.status;
+          if (args.priority !== undefined) ticketFields.priority = args.priority;
+          if (args.severity !== undefined) ticketFields.severity = args.severity;
+          if (args.type !== undefined) ticketFields.type = args.type;
+          if (args.assignedAppUserId !== undefined) ticketFields.assignedAppUserId = args.assignedAppUserId;
+          const comment = args.comment ? { public: true, body: args.comment } : undefined;
+          return this.result(await this.api.updateTicket(args.ticketId, ticketFields, comment));
         }
         case 'add_ticket_comment': {
           if (!args.confirm) {
@@ -1606,11 +1617,12 @@ class NinjaOneMCPServer {
           return this.result(await this.api.getWebhookConfig());
         case 'set_webhook_config': {
           if (!args.confirm) {
-            return this.dryRun(`Would configure webhook.\nURL: ${args.webhookUrl}\nActivities: ${args.activities ? args.activities.join(', ') : 'all'}`);
+            return this.dryRun(`Would configure webhook.\nURL: ${args.url}\nActivities: ${args.activities ? JSON.stringify(args.activities) : 'all'}`);
           }
-          const body: any = { webhookUrl: args.webhookUrl };
-          if (args.secret !== undefined) body.secret = args.secret;
+          const body: any = { url: args.url };
           if (args.activities !== undefined) body.activities = args.activities;
+          if (args.expand !== undefined) body.expand = args.expand;
+          if (args.headers !== undefined) body.headers = args.headers;
           return this.result(await this.api.setWebhookConfig(body));
         }
         case 'delete_webhook_config': {

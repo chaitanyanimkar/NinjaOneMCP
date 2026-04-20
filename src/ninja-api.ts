@@ -312,8 +312,8 @@ export class NinjaOneAPI {
     return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/control`, 'POST', { action });
   }
 
-  async configureWindowsService(id: number, serviceId: string, startupType: string): Promise<any> {
-    return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/configure`, 'POST', { startupType });
+  async configureWindowsService(id: number, serviceId: string, startType: string): Promise<any> {
+    return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/configure`, 'POST', { startType });
   }
 
   // Policy Management
@@ -355,11 +355,8 @@ export class NinjaOneAPI {
     };
   }
 
-  async generateOrganizationInstaller(installerType: string, locationId?: number, organizationId?: number): Promise<any> {
-    const body: any = { installerType };
-    if (locationId) body.locationId = locationId;
-    if (organizationId) body.organizationId = organizationId;
-    return this.makeRequest('/v2/organization/generate-installer', 'POST', body);
+  async generateOrganizationInstaller(organizationId: number, locationId: number, installerType: string): Promise<any> {
+    return this.makeRequest(`/v2/organization/${organizationId}/location/${locationId}/installer/${installerType}`);
   }
 
   // Organization CRUD
@@ -753,28 +750,43 @@ export class NinjaOneAPI {
   }
 
   async createTicket(body: {
-    boardId: number;
-    subject: string;
-    description?: string;
+    clientId?: number;
+    ticketFormId?: number;
+    nodeId?: number;
+    summary: string;
+    description?: { public?: boolean; body?: string; htmlBody?: string };
     status?: string;
     priority?: string;
     severity?: string;
     type?: string;
     assignedAppUserId?: number;
-    deviceId?: number;
+    tags?: string[];
   }): Promise<any> {
     return this.makeRequest('/v2/ticketing/ticket', 'POST', body);
   }
 
-  async updateTicket(ticketId: number, body: {
-    subject?: string;
-    description?: string;
+  async updateTicket(ticketId: number, ticketFields: {
+    summary?: string;
     status?: string;
     priority?: string;
     severity?: string;
+    type?: string;
     assignedAppUserId?: number;
-  }): Promise<any> {
-    return this.makeRequest(`/v2/ticketing/ticket/${ticketId}`, 'PATCH', body);
+    nodeId?: number;
+    tags?: string[];
+  }, comment?: { public?: boolean; body?: string }): Promise<any> {
+    // Spec requires version and ticketFormId — fetch current ticket first
+    const current = await this.getTicket(ticketId);
+    const body: any = {
+      ticket: {
+        version: current.version,
+        ticketFormId: current.ticketFormId,
+        clientId: current.clientId,
+        ...ticketFields
+      }
+    };
+    if (comment) body.comment = comment;
+    return this.makeRequest(`/v2/ticketing/ticket/${ticketId}`, 'PUT', body);
   }
 
   async addTicketComment(ticketId: number, comment: string, appUserId?: number): Promise<any> {
@@ -799,10 +811,10 @@ export class NinjaOneAPI {
   }
 
   async setWebhookConfig(body: {
-    webhookUrl: string;
-    secret?: string;
-    activities?: string[];
-    expandedActivities?: string[];
+    url: string;
+    activities?: Record<string, string[]>;
+    expand?: string[];
+    headers?: Record<string, string>;
   }): Promise<any> {
     return this.makeRequest('/v2/webhook', 'PUT', body);
   }
