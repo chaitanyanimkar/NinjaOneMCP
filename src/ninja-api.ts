@@ -789,10 +789,9 @@ export class NinjaOneAPI {
     return this.makeRequest(`/v2/ticketing/ticket/${ticketId}`, 'PUT', body);
   }
 
-  async addTicketComment(ticketId: number, comment: string, appUserId?: number): Promise<any> {
-    const body: any = { comment };
-    if (appUserId !== undefined) body.appUserId = appUserId;
-    return this.makeRequest(`/v2/ticketing/ticket/${ticketId}/log-entry`, 'POST', body);
+  async addTicketComment(ticketId: number, comment: string, _appUserId?: number): Promise<any> {
+    // No POST to log-entry. Comments are added via PUT updateTicket with a comment field.
+    return this.updateTicket(ticketId, {}, { public: true, body: comment });
   }
 
   // Phase 3 — Webhooks & event-driven
@@ -892,15 +891,28 @@ export class NinjaOneAPI {
   }
 
   async getScriptResult(deviceId: number, activityId: number): Promise<any> {
-    return this.makeRequest(`/v2/device/${deviceId}/script/run/${activityId}/result`);
+    // No dedicated script result endpoint. Poll device activities for the result.
+    const activities = await this.getDeviceActivities(deviceId, 50);
+    const results: any[] = activities?.activities || activities || [];
+    const match = Array.isArray(results)
+      ? results.find((a: any) => a.id === activityId || a.activityId === activityId)
+      : null;
+    if (match) return match;
+    return { note: `Activity ${activityId} not found in recent device activities. The script may still be running.`, deviceId, activityId };
   }
 
   async getPolicy(policyId: number): Promise<any> {
-    return this.makeRequest(`/v2/policies/${policyId}`);
+    // No single-policy GET endpoint exists. Fetch all and filter.
+    const policies = await this.getPolicies();
+    if (!Array.isArray(policies)) return policies;
+    const policy = policies.find((p: any) => p.id === policyId);
+    if (!policy) throw new Error(`Policy ${policyId} not found`);
+    return policy;
   }
 
   async assignDevicePolicy(deviceId: number, policyId: number): Promise<any> {
-    return this.makeRequest(`/v2/device/${deviceId}/policy/${policyId}`, 'PUT', {});
+    // No dedicated policy assignment endpoint. Use device PATCH with policyId.
+    return this.makeRequest(`/v2/device/${deviceId}`, 'PATCH', { policyId });
   }
 
   async getPendingDevices(): Promise<any> {
