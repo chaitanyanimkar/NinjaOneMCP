@@ -126,7 +126,8 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        since: { type: 'string', description: 'ISO timestamp for alerts since' }
+        sourceType: { type: 'string', description: 'Alert source type filter' },
+        df: { type: 'string', description: 'Device filter (e.g., "org = 1")' }
       }
     }
   },
@@ -558,7 +559,7 @@ const TOOLS = [
   {
     name: 'get_policies',
     description: 'List policies (optionally templates only)',
-    inputSchema: { type: 'object', properties: { templateOnly: { type: 'boolean' } } }
+    inputSchema: { type: 'object', properties: {} }
   },
 
   // System Information Query Tools
@@ -957,7 +958,7 @@ const TOOLS = [
       properties: {
         boardId: { type: 'number', description: 'Ticket board ID' },
         pageSize: { type: 'number', description: 'Results per page (default: 25)' },
-        after: { type: 'number', description: 'Pagination cursor' }
+        lastCursorId: { type: 'number', description: 'Pagination cursor (last cursor ID from previous response)' }
       },
       required: ['boardId']
     }
@@ -1094,10 +1095,12 @@ const TOOLS = [
       type: 'object',
       properties: {
         pageSize: { type: 'number', description: 'Results per page (default: 50)' },
-        after: { type: 'number', description: 'Pagination cursor (activity ID)' },
+        after: { type: 'number', description: 'Return activities after this activity ID' },
+        olderThan: { type: 'number', description: 'Return activities older than this activity ID' },
+        newerThan: { type: 'number', description: 'Return activities newer than this activity ID' },
         type: { type: 'string', description: 'Activity type filter' },
-        deviceId: { type: 'number', description: 'Filter by device ID' },
-        userId: { type: 'number', description: 'Filter by user ID' },
+        df: { type: 'string', description: 'Device filter (e.g., "org = 1")' },
+        user: { type: 'number', description: 'Filter by user ID' },
         status: { type: 'string', description: 'Filter by status' }
       }
     }
@@ -1118,9 +1121,9 @@ const TOOLS = [
       properties: {
         deviceId: { type: 'number', description: 'Device ID' },
         scriptId: { type: 'number', description: 'Script/automation ID from NinjaOne' },
+        type: { type: 'string', enum: ['ACTION', 'SCRIPT'], description: 'Script type (default: SCRIPT)' },
         runAs: { type: 'string', description: 'Execution context (default: SYSTEM)' },
         parameters: { type: 'string', description: 'Script parameters string' },
-        timeout: { type: 'number', description: 'Timeout in seconds (default: 300)' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
       required: ['deviceId', 'scriptId']
@@ -1336,7 +1339,7 @@ class NinjaOneMCPServer {
 
         // ── Alerts ──
         case 'get_alerts':
-          return this.result(await this.api.getAlerts(undefined, args.since));
+          return this.result(await this.api.getAlerts(args.df, args.sourceType));
         case 'get_alert':
           return this.result(await this.api.getAlert(args.uid));
         case 'get_device_alerts':
@@ -1462,7 +1465,7 @@ class NinjaOneMCPServer {
           return this.result(await this.api.resetDevicePolicyOverrides(args.id));
         }
         case 'get_policies':
-          return this.result(await this.api.getPolicies(args.templateOnly));
+          return this.result(await this.api.getPolicies());
 
         // ── System Information Queries ──
         case 'query_antivirus_status':
@@ -1560,7 +1563,7 @@ class NinjaOneMCPServer {
         case 'get_ticket_boards':
           return this.result(await this.api.getTicketBoards());
         case 'get_tickets':
-          return this.result(await this.api.getTickets(args.boardId, args.pageSize || 25, args.after));
+          return this.result(await this.api.getTickets(args.boardId, args.pageSize || 25, args.lastCursorId));
         case 'get_ticket':
           return this.result(await this.api.getTicket(args.ticketId));
         case 'get_ticket_log':
@@ -1641,9 +1644,11 @@ class NinjaOneMCPServer {
           return this.result(await this.api.getActivities({
             pageSize: args.pageSize || 50,
             after: args.after,
+            olderThan: args.olderThan,
+            newerThan: args.newerThan,
             type: args.type,
-            deviceId: args.deviceId,
-            userId: args.userId,
+            df: args.df,
+            user: args.user,
             status: args.status
           }));
 
@@ -1653,13 +1658,13 @@ class NinjaOneMCPServer {
         case 'run_device_script': {
           if (!args.confirm) {
             const device = await this.api.getDevice(args.deviceId);
-            return this.dryRun(`Would run script id=${args.scriptId} on device id=${args.deviceId} (${device.systemName || device.displayName || 'unknown'}).\nRun as: ${args.runAs || 'SYSTEM'}\nParameters: ${args.parameters || 'none'}\nTimeout: ${args.timeout || 300}s`);
+            return this.dryRun(`Would run script id=${args.scriptId} on device id=${args.deviceId} (${device.systemName || device.displayName || 'unknown'}).\nType: ${args.type || 'SCRIPT'}\nRun as: ${args.runAs || 'SYSTEM'}\nParameters: ${args.parameters || 'none'}`);
           }
           return this.result(await this.api.runDeviceScript(args.deviceId, {
+            type: args.type || 'SCRIPT',
             id: args.scriptId,
             runAs: args.runAs || 'SYSTEM',
-            parameters: args.parameters,
-            timeout: args.timeout || 300
+            parameters: args.parameters
           }));
         }
         case 'get_script_result':

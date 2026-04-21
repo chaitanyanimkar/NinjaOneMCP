@@ -257,14 +257,10 @@ export class NinjaOneAPI {
     // Schedule maintenance to begin five seconds from "now" to avoid
     // immediately-expired windows due to API processing delays.
     const start = Math.floor((Date.now() + 5000) / 1000);
-    const reasonMessage = duration.permanent
-      ? 'Maintenance mode enabled via API (permanent)'
-      : `Maintenance mode enabled via API for ${duration.value} ${duration.unit.toLowerCase()}`;
 
     const body: Record<string, unknown> = {
       disabledFeatures: ['ALERTS', 'PATCHING', 'AVSCANS', 'TASKS'],
-      start,
-      reasonMessage
+      start
     };
 
     if (duration && !duration.permanent) {
@@ -318,8 +314,8 @@ export class NinjaOneAPI {
 
   // Policy Management
   
-  async getPolicies(templateOnly?: boolean): Promise<any> {
-    return this.makeRequest(`/v2/policies${this.buildQuery({ templateOnly })}`);
+  async getPolicies(): Promise<any> {
+    return this.makeRequest('/v2/policies');
   }
 
   async getDevicePolicyOverrides(id: number): Promise<any> {
@@ -386,16 +382,9 @@ export class NinjaOneAPI {
     const body: any = {};
     if (name !== undefined) body.name = name;
     if (description !== undefined) body.description = description;
-    // nodeApprovalMode is intentionally ignored because the public API treats it as read-only after creation.
+    if (nodeApprovalMode !== undefined) body.nodeApprovalMode = nodeApprovalMode;
     if (tags !== undefined) body.tags = tags;
-    try {
-      return await this.makeRequest(`/v2/organizations/${id}`, 'PATCH', body);
-    } catch (error: any) {
-      if (typeof error?.message === 'string' && error.message.includes('404')) {
-        return this.makeRequest(`/v2/organization/${id}`, 'PATCH', body);
-      }
-      throw error;
-    }
+    return this.makeRequest(`/v2/organization/${id}`, 'PATCH', body);
   }
 
   // Location CRUD
@@ -473,8 +462,8 @@ export class NinjaOneAPI {
 
   // Alert Management
   
-  async getAlerts(deviceFilter?: string, since?: string): Promise<any> {
-    return this.makeRequest(`/v2/alerts${this.buildQuery({ df: deviceFilter, since })}`);
+  async getAlerts(deviceFilter?: string, sourceType?: string): Promise<any> {
+    return this.makeRequest(`/v2/alerts${this.buildQuery({ df: deviceFilter, sourceType })}`);
   }
 
   async getAlert(uid: string): Promise<any> {
@@ -734,10 +723,10 @@ export class NinjaOneAPI {
     return this.makeRequest('/v2/ticketing/trigger/boards');
   }
 
-  async getTickets(boardId: number, pageSize?: number, after?: number): Promise<any> {
+  async getTickets(boardId: number, pageSize?: number, lastCursorId?: number): Promise<any> {
     const body: any = {};
     if (pageSize !== undefined) body.pageSize = pageSize;
-    if (after !== undefined) body.after = after;
+    if (lastCursorId !== undefined) body.lastCursorId = lastCursorId;
     return this.makeRequest(`/v2/ticketing/trigger/board/${boardId}/run`, 'POST', body);
   }
 
@@ -852,10 +841,13 @@ export class NinjaOneAPI {
     pageSize?: number;
     after?: number;
     before?: number;
+    olderThan?: number;
+    newerThan?: number;
     type?: string;
-    deviceId?: number;
-    userId?: number;
+    df?: string;
+    user?: number;
     status?: string;
+    seriesUid?: string;
   }): Promise<any> {
     const query = this.buildQuery(params || {});
     return this.makeRequest(`/v2/activities${query}`);
@@ -882,12 +874,14 @@ export class NinjaOneAPI {
   }
 
   async runDeviceScript(deviceId: number, body: {
+    type?: string;
     id: number;
+    uid?: string;
     runAs?: string;
     parameters?: string;
-    timeout?: number;
   }): Promise<any> {
-    return this.makeRequest(`/v2/device/${deviceId}/script/run`, 'POST', body);
+    const payload = { type: body.type || 'SCRIPT', ...body };
+    return this.makeRequest(`/v2/device/${deviceId}/script/run`, 'POST', payload);
   }
 
   async getScriptResult(deviceId: number, activityId: number): Promise<any> {
