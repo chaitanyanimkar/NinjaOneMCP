@@ -337,14 +337,14 @@ export class NinjaOneAPI {
     return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/control`, 'POST', { action });
   }
 
-  async configureWindowsService(id: number, serviceId: string, startType: string): Promise<any> {
-    return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/configure`, 'POST', { startType });
+  async configureWindowsService(id: number, serviceId: string, startupType: string): Promise<any> {
+    return this.makeRequest(`/v2/device/${id}/windows-service/${serviceId}/configure`, 'POST', { startupType });
   }
 
   // Policy Management
   
-  async getPolicies(): Promise<any> {
-    return this.makeRequest('/v2/policies');
+  async getPolicies(templateOnly?: boolean): Promise<any> {
+    return this.makeRequest(`/v2/policies${this.buildQuery({ templateOnly })}`);
   }
 
   async getDevicePolicyOverrides(id: number): Promise<any> {
@@ -380,8 +380,11 @@ export class NinjaOneAPI {
     };
   }
 
-  async generateOrganizationInstaller(organizationId: number, locationId: number, installerType: string): Promise<any> {
-    return this.makeRequest(`/v2/organization/${organizationId}/location/${locationId}/installer/${installerType}`);
+  async generateOrganizationInstaller(installerType: string, locationId?: number, organizationId?: number): Promise<any> {
+    const body: any = { installerType };
+    if (locationId) body.locationId = locationId;
+    if (organizationId) body.organizationId = organizationId;
+    return this.makeRequest('/v2/organization/generate-installer', 'POST', body);
   }
 
   // Organization CRUD
@@ -491,8 +494,8 @@ export class NinjaOneAPI {
 
   // Alert Management
   
-  async getAlerts(deviceFilter?: string, sourceType?: string): Promise<any> {
-    return this.makeRequest(`/v2/alerts${this.buildQuery({ df: deviceFilter, sourceType })}`);
+  async getAlerts(deviceFilter?: string, sourceType?: string, since?: string): Promise<any> {
+    return this.makeRequest(`/v2/alerts${this.buildQuery({ df: deviceFilter, sourceType, since })}`);
   }
 
   async getAlert(uid: string): Promise<any> {

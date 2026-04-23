@@ -127,6 +127,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         sourceType: { type: 'string', description: 'Alert source type filter' },
+        since: { type: 'string', description: 'ISO timestamp — return alerts created after this time' },
         df: { type: 'string', description: 'Device filter (e.g., "org = 1")' }
       }
     }
@@ -216,9 +217,9 @@ const TOOLS = [
       properties: {
         id: { type: 'number', description: 'Device ID' },
         serviceId: { type: 'string', description: 'Service ID' },
-        startType: { type: 'string', description: 'Startup type (e.g., AUTOMATIC, MANUAL, DISABLED)' }
+        startupType: { type: 'string', description: 'Startup type (e.g., AUTOMATIC, MANUAL, DISABLED)' }
       },
-      required: ['id', 'serviceId', 'startType']
+      required: ['id', 'serviceId', 'startupType']
     }
   },
   // Device Patching
@@ -559,7 +560,12 @@ const TOOLS = [
   {
     name: 'get_policies',
     description: 'List policies (optionally templates only)',
-    inputSchema: { type: 'object', properties: {} }
+    inputSchema: {
+      type: 'object',
+      properties: {
+        templateOnly: { type: 'boolean', description: 'If true, return only policy templates' }
+      }
+    }
   },
 
   // System Information Query Tools
@@ -1356,7 +1362,7 @@ class NinjaOneMCPServer {
 
         // ── Alerts ──
         case 'get_alerts':
-          return this.result(await this.api.getAlerts(args.df, args.sourceType));
+          return this.result(await this.api.getAlerts(args.df, args.sourceType, args.since));
         case 'get_alert':
           return this.result(await this.api.getAlert(args.uid));
         case 'get_device_alerts':
@@ -1381,7 +1387,7 @@ class NinjaOneMCPServer {
         case 'get_organization_policies':
           return this.result(await this.api.getOrganizationPolicies(args.id));
         case 'generate_organization_installer':
-          return this.result(await this.api.generateOrganizationInstaller(args.organizationId, args.locationId, args.installerType));
+          return this.result(await this.api.generateOrganizationInstaller(args.installerType, args.locationId, args.organizationId));
         case 'create_organization':
           return this.result(await this.api.createOrganization(args.name, args.description, args.nodeApprovalMode, args.tags));
         case 'update_organization':
@@ -1406,7 +1412,7 @@ class NinjaOneMCPServer {
         case 'control_windows_service':
           return this.result(await this.api.controlWindowsService(args.id, args.serviceId, args.action));
         case 'configure_windows_service':
-          return this.result(await this.api.configureWindowsService(args.id, args.serviceId, args.startType));
+          return this.result(await this.api.configureWindowsService(args.id, args.serviceId, args.startupType));
 
         // ── Patching ──
         case 'scan_device_os_patches':
@@ -1482,7 +1488,7 @@ class NinjaOneMCPServer {
           return this.result(await this.api.resetDevicePolicyOverrides(args.id));
         }
         case 'get_policies':
-          return this.result(await this.api.getPolicies());
+          return this.result(await this.api.getPolicies(args.templateOnly));
 
         // ── System Information Queries ──
         case 'query_antivirus_status':
