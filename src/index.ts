@@ -951,6 +951,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} }
   },
   {
+    name: 'get_ticket_statuses',
+    description: 'List all ticket status values configured in NinjaOne (parent + sub-statuses). Use before update_ticket to find valid status names.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
     name: 'get_tickets',
     description: 'List tickets from a board with pagination',
     inputSchema: {
@@ -1004,13 +1009,13 @@ const TOOLS = [
   },
   {
     name: 'update_ticket',
-    description: 'Update an existing ticket. Automatically fetches version/ticketFormId. Set confirm=true to execute; default is dry-run.',
+    description: 'Update an existing ticket. Fetches current state automatically — only specify fields you want to change. Set confirm=true to execute; default is dry-run.',
     inputSchema: {
       type: 'object',
       properties: {
         ticketId: { type: 'number', description: 'Ticket ID' },
-        summary: { type: 'string', description: 'Ticket summary (max 200 chars)' },
-        status: { type: 'string', enum: ['NEW', 'OPEN', 'WAITING', 'PAUSED', 'RESOLVED', 'CLOSED'], description: 'Ticket status' },
+        summary: { type: 'string', description: 'Ticket subject/summary (max 200 chars)' },
+        status: { type: 'string', description: 'Status name (e.g. NEW, OPEN, WAITING, PAUSED, RESOLVED, CLOSED, APPROVED, REJECTED — or tenant-specific sub-statuses like "Awaiting Response"). Fetch full catalog via get_ticket_statuses.' },
         priority: { type: 'string', enum: ['NONE', 'LOW', 'MEDIUM', 'HIGH'], description: 'Priority' },
         severity: { type: 'string', enum: ['NONE', 'MINOR', 'MODERATE', 'MAJOR', 'CRITICAL'], description: 'Severity' },
         type: { type: 'string', enum: ['PROBLEM', 'QUESTION', 'INCIDENT', 'TASK'], description: 'Ticket type' },
@@ -1023,13 +1028,13 @@ const TOOLS = [
   },
   {
     name: 'add_ticket_comment',
-    description: 'Add a comment/note to a ticket. Set confirm=true to execute; default is dry-run.',
+    description: 'Add a comment/note to a ticket via POST /v2/ticketing/ticket/{id}/comment. Set confirm=true to execute; default is dry-run.',
     inputSchema: {
       type: 'object',
       properties: {
         ticketId: { type: 'number', description: 'Ticket ID' },
         comment: { type: 'string', description: 'Comment text' },
-        appUserId: { type: 'number', description: 'App user ID posting the comment' },
+        public: { type: 'boolean', description: 'Whether the comment is visible to end users (default true)' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
       required: ['ticketId', 'comment']
@@ -1052,7 +1057,19 @@ const TOOLS = [
         url: { type: 'string', description: 'Webhook URL to receive events' },
         activities: { type: 'object', description: 'Map of activity categories to event type arrays (e.g., {"DEVICE": ["ADDED", "DELETED"]})' },
         expand: { type: 'array', items: { type: 'string' }, description: 'Activity types to include expanded data for' },
-        headers: { type: 'object', description: 'Custom HTTP headers to send with webhook requests (use for auth/secrets)' },
+        headers: {
+          type: 'array',
+          description: 'Custom HTTP headers (array of {name, value} objects) — use for auth/secrets',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              value: { type: 'string' }
+            },
+            required: ['name', 'value']
+          }
+        },
+        organizationIds: { type: 'array', items: { type: 'number' }, description: 'Limit webhook to specific organization IDs (optional)' },
         confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
       },
       required: ['url']
@@ -1562,6 +1579,8 @@ class NinjaOneMCPServer {
         // ── Phase 2: Ticketing ──
         case 'get_ticket_boards':
           return this.result(await this.api.getTicketBoards());
+        case 'get_ticket_statuses':
+          return this.result(await this.api.getTicketStatuses());
         case 'get_tickets':
           return this.result(await this.api.getTickets(args.boardId, args.pageSize || 25, args.lastCursorId));
         case 'get_ticket':
@@ -1612,7 +1631,8 @@ class NinjaOneMCPServer {
           if (!args.confirm) {
             return this.dryRun(`Would add comment to ticket id=${args.ticketId}.\nComment: "${args.comment}"`);
           }
-          return this.result(await this.api.addTicketComment(args.ticketId, args.comment, args.appUserId));
+          const isPublic = args.public !== false;
+          return this.result(await this.api.addTicketComment(args.ticketId, args.comment, isPublic));
         }
 
         // ── Phase 3: Webhooks ──
@@ -1626,6 +1646,7 @@ class NinjaOneMCPServer {
           if (args.activities !== undefined) body.activities = args.activities;
           if (args.expand !== undefined) body.expand = args.expand;
           if (args.headers !== undefined) body.headers = args.headers;
+          if (args.organizationIds !== undefined) body.organizationIds = args.organizationIds;
           return this.result(await this.api.setWebhookConfig(body));
         }
         case 'delete_webhook_config': {
