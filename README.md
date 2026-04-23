@@ -75,7 +75,7 @@ Download the latest `ninjaone-rmm.mcpb` bundle file from this repository. This i
 - **Client ID**: OAuth2 application client ID
 - **Client Secret**: OAuth2 application client secret
 
-**Note**: No refresh token required - uses OAuth2 client credentials flow for authentication.
+**Note**: Reads work with OAuth2 client credentials. Ticket writes (`create_ticket`, `update_ticket`, `add_ticket_comment`) and `run_device_script` require user-context tokens — see [User-Context OAuth](#user-context-oauth-authorization-code-flow).
 
 #### Option 2: From Source (Development)
 
@@ -117,6 +117,24 @@ npm run start:sse       # SSE on port 3001
 # Development mode with auto-rebuild
 npm run dev
 ```
+
+### User-Context OAuth (Authorization Code Flow)
+
+NinjaOne requires a user-context token for ticket write operations and script execution. The server transparently prefers a stored user-context token when present and falls back to client_credentials for reads.
+
+**One-time setup:**
+
+1. In NinjaOne admin → Apps → API, create a **Web Application** client app (not "API Services") with:
+   - Redirect URI: `http://localhost:8765/callback`
+   - Scopes: Monitoring + Management + Control
+   - Allowed grant types: Authorization code + Client credentials + Refresh token
+2. Put the new client ID/secret in `.env` (and the MCP client config — see below).
+3. Run `npm run auth`. A browser opens to the NinjaOne consent screen; click **Authorize** + **Remember my decision**.
+4. The refresh token is saved to `~/.ninjaone-mcp/tokens.json` (mode 600).
+
+After that, ticket and script operations work attributed to the consenting user. Each teammate runs `npm run auth` on their own machine.
+
+**Tip:** if your default browser is intercepted by an extension/proxy and shows a JSON 404 instead of the consent screen, copy the URL printed in the terminal into an incognito window.
 
 ## Usage Examples
 
@@ -220,9 +238,22 @@ The NinjaOne Public API has the following known limitations:
 ### End Users
 - **Update Phone**: The phone field can be set during creation but cannot be updated afterwards
 
-### Other Restrictions
-- **Script Execution**: Running scripts requires authorization code flow, not supported with client credentials
-- All other CRUD operations work as expected
+### Auth Flow Restrictions
+NinjaOne returns `403 user_context_required` for several endpoints when called with a client_credentials token. These require an authorization_code (user-context) token:
+- `create_ticket`, `update_ticket`, `add_ticket_comment`
+- `run_device_script`
+
+Run `npm run auth` once to bootstrap the user-context flow — see [User-Context OAuth](#user-context-oauth-authorization-code-flow). Reads and most device-management writes (e.g. `set_device_maintenance`, `assign_device_policy`) work with either flow.
+
+### MCP Security Wrappers (Check Point MCP Protect, similar)
+If your environment runs MCP servers behind a security proxy (e.g. Check Point's `infinity-mcp-protect`, which appears at `C:\Windows\system32\infinity-mcp-protect.exe`), the wrapper may intercept outbound NinjaOne traffic and rewrite or strip credentials. Symptoms:
+- Read operations succeed.
+- `update_ticket` / `create_ticket` / `add_ticket_comment` / `set_device_maintenance` / `set_webhook_config` / `run_device_script` return `401`, `403`, `415`, or `400` even when the same credentials work in a direct (non-wrapped) Node process.
+
+This is the wrapper enforcing policy — not an MCP server bug. Resolution options:
+1. Ask whoever administers the wrapper to allowlist this MCP server's binary path / hash and the NinjaOne API origin.
+2. For local development on a machine you own, temporarily change the `command` in `claude_desktop_config.json` from the wrapper to `node` directly, restart Claude Desktop, and retest. **Do not ship that config to teammates** — it bypasses the security control.
+3. Accept the limitation: ticket writes happen in the NinjaOne UI directly, while the MCP supplies read context for Claude to draft the change.
 
 ## MCP Integration
 
@@ -361,7 +392,7 @@ This gives the operator a chance to review before committing.
 - **Policy management**: `get_policy`, `assign_device_policy` with confirm
 - **Device approval**: `get_pending_devices`, `approve_devices` with confirm
 
-> **Note**: Some features (ticketing creation, script execution) require NinjaOne authorization code flow rather than client credentials. These tools will return informational messages when the required auth context is not available.
+> **Note**: Ticket writes (`create_ticket`, `update_ticket`, `add_ticket_comment`) and `run_device_script` require a user-context token (authorization_code flow). Run `npm run auth` once to enable them — see [User-Context OAuth](#user-context-oauth-authorization-code-flow). Reads keep working with client_credentials alone.
 
 See [TOOLS.md](TOOLS.md) for the complete tool reference with parameters.
 
@@ -415,6 +446,10 @@ npm test
 **Permission Errors**
 - Verify your OAuth client has required scopes (monitoring, management, control)
 - Check organization/location access permissions
+- `403 user_context_required` on ticket writes / `run_device_script` → run `npm run auth` to bootstrap the user-context flow
+
+**Reads work but writes return 401 / 403 / 415 / 400 inside Claude Desktop while a direct `node dist/index.js` succeeds**
+- Likely an MCP security wrapper (e.g. Check Point `infinity-mcp-protect`) intercepting outbound traffic. See [MCP Security Wrappers](#mcp-security-wrappers-check-point-mcp-protect-similar) for resolution paths.
 
 **Transport Issues**
 - For STDIO: Ensure proper MCP client configuration
