@@ -16,3 +16,6 @@ Thumbs.db
 
 # Bundle backups
 *.mcpb.bak
+
+# Claude Code local workspace settings
+.claude/

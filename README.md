@@ -245,16 +245,6 @@ NinjaOne returns `403 user_context_required` for several endpoints when called w
 
 Run `npm run auth` once to bootstrap the user-context flow — see [User-Context OAuth](#user-context-oauth-authorization-code-flow). Reads and most device-management writes (e.g. `set_device_maintenance`, `assign_device_policy`) work with either flow.
 
-### MCP Security Wrappers (Check Point MCP Protect, similar)
-If your environment runs MCP servers behind a security proxy (e.g. Check Point's `infinity-mcp-protect`, which appears at `C:\Windows\system32\infinity-mcp-protect.exe`), the wrapper may intercept outbound NinjaOne traffic and rewrite or strip credentials. Symptoms:
-- Read operations succeed.
-- `update_ticket` / `create_ticket` / `add_ticket_comment` / `set_device_maintenance` / `set_webhook_config` / `run_device_script` return `401`, `403`, `415`, or `400` even when the same credentials work in a direct (non-wrapped) Node process.
-
-This is the wrapper enforcing policy — not an MCP server bug. Resolution options:
-1. Ask whoever administers the wrapper to allowlist this MCP server's binary path / hash and the NinjaOne API origin.
-2. For local development on a machine you own, temporarily change the `command` in `claude_desktop_config.json` from the wrapper to `node` directly, restart Claude Desktop, and retest. **Do not ship that config to teammates** — it bypasses the security control.
-3. Accept the limitation: ticket writes happen in the NinjaOne UI directly, while the MCP supplies read context for Claude to draft the change.
-
 ## MCP Integration
 
 ### Claude Desktop Configuration (Generic)
@@ -448,8 +438,6 @@ npm test
 - Check organization/location access permissions
 - `403 user_context_required` on ticket writes / `run_device_script` → run `npm run auth` to bootstrap the user-context flow
 
-**Reads work but writes return 401 / 403 / 415 / 400 inside Claude Desktop while a direct `node dist/index.js` succeeds**
-- Likely an MCP security wrapper (e.g. Check Point `infinity-mcp-protect`) intercepting outbound traffic. See [MCP Security Wrappers](#mcp-security-wrappers-check-point-mcp-protect-similar) for resolution paths.
 
 **Transport Issues**
 - For STDIO: Ensure proper MCP client configuration
