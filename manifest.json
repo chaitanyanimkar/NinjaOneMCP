@@ -24,15 +24,32 @@
         "${__dirname}/dist/index.js"
       ],
       "env": {
-        "NINJA_BASE_URL": "https://ca.ninjarmm.com",
-        "NINJA_CLIENT_ID": "REDACTED_CLIENT_ID",
-        "NINJA_CLIENT_SECRET": "REDACTED_CLIENT_SECRET",
+        "NINJA_BASE_URL": "${user_config.base_url}",
+        "NINJA_CLIENT_ID": "${user_config.client_id}",
+        "NINJA_CLIENT_SECRET": "${user_config.client_secret}",
         "LOG_LEVEL": "${user_config.log_level}",
         "NODE_ENV": "production"
       }
     }
   },
   "user_config": {
+    "base_url": {
+      "type": "string",
+      "title": "NinjaONE Base URL",
+      "description": "Your NinjaONE regional API endpoint (e.g., https://app.ninjarmm.com, https://eu.ninjarmm.com)",
+      "default": "https://app.ninjarmm.com"
+    },
+    "client_id": {
+      "type": "string",
+      "title": "OAuth Client ID",
+      "description": "Your NinjaONE OAuth2 application client ID"
+    },
+    "client_secret": {
+      "type": "string",
+      "title": "OAuth Client Secret",
+      "description": "Your NinjaONE OAuth2 application client secret",
+      "sensitive": true
+    },
     "log_level": {
       "type": "string",
       "title": "Log Level",
