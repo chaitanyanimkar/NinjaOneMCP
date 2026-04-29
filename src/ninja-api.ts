@@ -311,6 +311,24 @@ export class NinjaOneAPI {
     return this.makeRequest(`/v2/devices/approval/${mode}`, 'POST', body);
   }
 
+  // Device Owner, Search, Scripting Options
+
+  async setDeviceOwner(deviceId: number, ownerUid: string): Promise<any> {
+    return this.makeRequest(`/v2/device/${deviceId}/owner/${ownerUid}`, 'POST');
+  }
+
+  async removeDeviceOwner(deviceId: number): Promise<any> {
+    return this.makeRequest(`/v2/device/${deviceId}/owner`, 'DELETE');
+  }
+
+  async searchDevices(q: string, limit?: number): Promise<any> {
+    return this.makeRequest(`/v2/devices/search${this.buildQuery({ q, limit })}`);
+  }
+
+  async requestScriptingOptions(deviceId: number, lang?: string): Promise<any> {
+    return this.makeRequest(`/v2/device/${deviceId}/scripting/options${this.buildQuery({ lang })}`);
+  }
+
   // Device Patches
 
   // Patch approval or rejection is only available via the NinjaOne dashboard or policies;
@@ -879,6 +897,24 @@ export class NinjaOneAPI {
     try { return JSON.parse(text); } catch { return { success: true }; }
   }
 
+  // Ticketing Depth (forms, attributes, contact roster)
+
+  async getTicketAttributes(): Promise<any> {
+    return this.makeRequest('/v2/ticketing/attributes');
+  }
+
+  async getTicketForms(): Promise<any> {
+    return this.makeRequest('/v2/ticketing/ticket-form');
+  }
+
+  async getTicketForm(formId: number): Promise<any> {
+    return this.makeRequest(`/v2/ticketing/ticket-form/${formId}`);
+  }
+
+  async getAllUserAndContacts(pageSize?: number, anchorNaturalId?: number, searchCriteria?: string): Promise<any> {
+    return this.makeRequest(`/v2/ticketing/app-user-contact${this.buildQuery({ pageSize, anchorNaturalId, searchCriteria })}`);
+  }
+
   // Phase 3 — Webhooks & event-driven
 
   async getWebhookConfig(): Promise<any> {
@@ -1023,5 +1059,144 @@ export class NinjaOneAPI {
 
   async getPendingDevices(): Promise<any> {
     return this.getDevices('status = PENDING', 200);
+  }
+
+  // === Workflows (orchestration) ===
+  //
+  // Multi-step workflows that combine several thin endpoint methods. These build
+  // a plan but do NOT execute writes. The MCP tool layer iterates the plan when
+  // confirm=true is passed.
+
+  async reassignContactOwnersToEndUsers(deviceIds?: number[]): Promise<{
+    wouldReassign: Array<{
+      deviceId: number;
+      deviceName: string;
+      contactEmail: string;
+      contactUid: string;
+      endUserUid: string;
+      endUserName: string;
+    }>;
+    unmatched: Array<{
+      deviceId: number;
+      deviceName: string;
+      contactEmail: string;
+      contactUid: string;
+      reason: 'no_scim_match';
+    }>;
+    ambiguous: Array<{
+      deviceId: number;
+      deviceName: string;
+      contactEmail: string;
+      contactUid: string;
+      matchedUids: string[];
+    }>;
+    alreadyEndUser: number;
+    ownerOrphaned: number;
+    ownerUnset: number;
+    outOfScope: number;
+    totalScanned: number;
+  }> {
+    const [contactsRaw, endUsersRaw] = await Promise.all([
+      this.getContacts(),
+      this.getEndUsers()
+    ]);
+    const contacts: any[] = Array.isArray(contactsRaw) ? contactsRaw : [];
+    const endUsers: any[] = Array.isArray(endUsersRaw) ? endUsersRaw : [];
+
+    const contactByUid = new Map<string, any>();
+    for (const c of contacts) {
+      if (c?.uid) contactByUid.set(c.uid, c);
+    }
+
+    const endUserByUid = new Map<string, any>();
+    const scimByEmail = new Map<string, any[]>();
+    for (const u of endUsers) {
+      if (u?.uid) endUserByUid.set(u.uid, u);
+      if (u?.scimUser === true && typeof u?.email === 'string') {
+        const key = u.email.trim().toLowerCase();
+        const arr = scimByEmail.get(key) ?? [];
+        arr.push(u);
+        scimByEmail.set(key, arr);
+      }
+    }
+
+    const devices: any[] = [];
+    let outOfScope = 0;
+    if (deviceIds && deviceIds.length > 0) {
+      for (const id of deviceIds) {
+        try {
+          const d = await this.getDevice(id);
+          if (d && typeof d === 'object') devices.push(d);
+          else outOfScope++;
+        } catch {
+          outOfScope++;
+        }
+      }
+    } else {
+      let after: number | undefined;
+      const pageSize = 1000;
+      // Paginate using the device id of the last item per the existing client convention.
+      while (true) {
+        const page = await this.getDevices(undefined, pageSize, after);
+        if (!Array.isArray(page) || page.length === 0) break;
+        devices.push(...page);
+        if (page.length < pageSize) break;
+        const last = page[page.length - 1];
+        if (typeof last?.id !== 'number') break;
+        after = last.id;
+      }
+    }
+
+    const wouldReassign: Array<{ deviceId: number; deviceName: string; contactEmail: string; contactUid: string; endUserUid: string; endUserName: string }> = [];
+    const unmatched: Array<{ deviceId: number; deviceName: string; contactEmail: string; contactUid: string; reason: 'no_scim_match' }> = [];
+    const ambiguous: Array<{ deviceId: number; deviceName: string; contactEmail: string; contactUid: string; matchedUids: string[] }> = [];
+    let alreadyEndUser = 0;
+    let ownerOrphaned = 0;
+    let ownerUnset = 0;
+
+    for (const dev of devices) {
+      const ownerUid: string | undefined = dev?.assignedOwnerUid;
+      const deviceId: number = dev?.id;
+      const deviceName: string = dev?.systemName || dev?.displayName || 'unknown';
+
+      if (!ownerUid) {
+        ownerUnset++;
+        continue;
+      }
+      if (endUserByUid.has(ownerUid)) {
+        alreadyEndUser++;
+        continue;
+      }
+      const contact = contactByUid.get(ownerUid);
+      if (!contact) {
+        ownerOrphaned++;
+        continue;
+      }
+
+      const email = typeof contact.email === 'string' ? contact.email.trim().toLowerCase() : '';
+      const matches = email ? (scimByEmail.get(email) ?? []) : [];
+      const contactEmail = typeof contact.email === 'string' ? contact.email : '';
+
+      if (matches.length === 0) {
+        unmatched.push({ deviceId, deviceName, contactEmail, contactUid: ownerUid, reason: 'no_scim_match' });
+      } else if (matches.length > 1) {
+        ambiguous.push({ deviceId, deviceName, contactEmail, contactUid: ownerUid, matchedUids: matches.map((m: any) => m.uid) });
+      } else {
+        const eu = matches[0];
+        const endUserName = `${eu.firstName ?? ''} ${eu.lastName ?? ''}`.trim() || eu.email || '';
+        wouldReassign.push({ deviceId, deviceName, contactEmail, contactUid: ownerUid, endUserUid: eu.uid, endUserName });
+      }
+    }
+
+    return {
+      wouldReassign,
+      unmatched,
+      ambiguous,
+      alreadyEndUser,
+      ownerOrphaned,
+      ownerUnset,
+      outOfScope,
+      totalScanned: devices.length
+    };
   }
 }

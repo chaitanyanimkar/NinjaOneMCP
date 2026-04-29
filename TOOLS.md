@@ -254,6 +254,55 @@ Tools marked with **(confirm)** below use this pattern.
 
 ---
 
+## Phase 5 — Device owner management, server-side search, ticketing depth
+
+### Device Owner
+
+| Tool | Confirm | Description | Parameters |
+|------|---------|-------------|------------|
+| `set_device_owner` | **(confirm)** | Set device owner to any user UID (contact, end-user, or technician) | `id`, `ownerUid`, `confirm?` |
+| `remove_device_owner` | **(confirm)** | Remove the owner of a device | `id`, `confirm?` |
+
+### Device Search & Scripting Pre-flight
+
+| Tool | Confirm | Description | Parameters |
+|------|---------|-------------|------------|
+| `search_devices` | — | Server-side device search by free-text query (matches name, logged-on user, IP, etc.) | `q`, `limit?` |
+| `request_scripting_options` | — | List available scripts and parameters for a device (pre-flight for `run_device_script`) | `id`, `lang?` |
+
+### Ticketing Depth
+
+| Tool | Confirm | Description | Parameters |
+|------|---------|-------------|------------|
+| `get_ticket_attributes` | — | List custom ticket attributes (board field schema) | — |
+| `get_ticket_forms` | — | List ticket forms with their field IDs | — |
+| `get_ticket_form` | — | Get a specific ticket form definition | `formId` |
+| `get_all_user_and_contacts` | — | Combined paginated roster of users and contacts | `pageSize?`, `anchorNaturalId?`, `searchCriteria?` |
+
+### Workflow — Contact-to-EndUser Owner Reassignment
+
+| Tool | Confirm | Description | Parameters |
+|------|---------|-------------|------------|
+| `reassign_contact_owners_to_endusers` | **(confirm)** | Scan devices, find contact-owned ones, and reassign ownership to matching SCIM-provisioned end users (lowercase email match, scimUser=true only). Reports unmatched/ambiguous separately. | `deviceIds?`, `confirm?` |
+
+**Workflow semantics:**
+
+- **Match rule:** lowercase-normalized email between `Contact.email` and `EndUser.email`. Only `scimUser === true` end users are eligible matches.
+- **Skip cases:** device owner already an end user, owner unset, owner UID not in either list (orphan), 0 SCIM matches, 2+ SCIM matches.
+- **Output (dry-run):** human-readable summary plus structured JSON. Skipped devices are reported in `unmatched` and `ambiguous` arrays so they can be saved to CSV for manual review.
+- **Execute:** iterates `wouldReassign` and calls `set_device_owner` per device. One device's failure does not abort the batch; per-device results are returned.
+- **Idempotency:** safe to re-run; already-migrated devices are silently skipped.
+
+**Recommended rollout:**
+
+1. Dry-run on 5–6 test devices via `deviceIds: [...]`
+2. Execute on those test devices with `confirm: true`
+3. Verify in NinjaOne UI
+4. Whole-tenant dry-run (no `deviceIds`)
+5. Whole-tenant execute with `confirm: true`
+
+---
+
 ## Device Filter Syntax
 
 Use NinjaONE's filter syntax for the `df` parameter:

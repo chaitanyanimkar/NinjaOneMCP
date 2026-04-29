@@ -191,8 +191,9 @@ await ninjaAPI.setDeviceMaintenance(12345, "OFF");
 
 Each object in the response matches the `Application` schema from the NinjaONE API and represents a single installed application.
 
-> ℹ️ **Note:** The NinjaONE public API does not expose dedicated endpoints for reading or setting device owners. Owner
-> information is returned as the `assignedOwnerUid` field in the `getDevice` response.
+> ℹ️ **Note:** Owner information is returned as the `assignedOwnerUid` field on `getDevice` responses. Use
+> `set_device_owner` and `remove_device_owner` (Phase 5) to write owner assignments. For bulk migration of
+> contact-owned devices to SCIM-provisioned end users, use `reassign_contact_owners_to_endusers`.
 
 ### Query Operations
 ```typescript

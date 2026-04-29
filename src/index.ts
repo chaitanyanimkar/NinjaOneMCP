@@ -1184,6 +1184,106 @@ const TOOLS = [
     name: 'get_pending_devices',
     description: 'List all devices awaiting approval',
     inputSchema: { type: 'object', properties: {} }
+  },
+
+  // Phase 5 — Device owner management, server-side search, ticketing depth, scripting options
+
+  {
+    name: 'set_device_owner',
+    description: 'Set device owner to any user UID (contact, end-user, or technician). Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        ownerUid: { type: 'string', description: 'UUID of the new owner (contact, end-user, or technician UID)' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id', 'ownerUid']
+    }
+  },
+  {
+    name: 'remove_device_owner',
+    description: 'Remove the owner of a device. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        confirm: { type: 'boolean', description: 'Set to true to execute. Default false (dry-run).' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'search_devices',
+    description: 'Server-side device search by free-text query (matches name, logged-on user, IP, etc.). Use instead of search_devices_by_name when fleet exceeds the first paginated page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', description: 'Search query (name, logged-on user, IP address, etc.)' },
+        limit: { type: 'number', description: 'Maximum number of devices to return' }
+      },
+      required: ['q']
+    }
+  },
+  {
+    name: 'request_scripting_options',
+    description: 'Pre-flight: list available scripts and their parameter shapes for a device. Useful before run_device_script.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Device ID' },
+        lang: { type: 'string', description: 'Optional language filter' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'get_ticket_attributes',
+    description: 'List custom ticket attributes (the field schema used by ticket boards).',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_ticket_forms',
+    description: 'List ticket forms with their field IDs.',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_ticket_form',
+    description: 'Get a specific ticket form definition (required fields, dropdowns, types).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        formId: { type: 'number', description: 'Ticket form ID' }
+      },
+      required: ['formId']
+    }
+  },
+  {
+    name: 'get_all_user_and_contacts',
+    description: 'Combined paginated roster of users (technicians, end-users) and contacts for ticket assignee or requester pickers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pageSize: { type: 'number', description: 'Records per page (default 50)' },
+        anchorNaturalId: { type: 'number', description: 'Last user identifier from previous page (cursor)' },
+        searchCriteria: { type: 'string', description: 'Search by first name, last name, or email' }
+      }
+    }
+  },
+  {
+    name: 'reassign_contact_owners_to_endusers',
+    description: 'WORKFLOW: scan devices, find ones owned by contacts, match each contact to its SCIM-provisioned end user by email, and reassign ownership. Email match is lowercased; only scimUser=true end users are eligible. Skips devices with 0 or 2+ matches; reports them. Set confirm=true to execute; default is dry-run.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deviceIds: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional explicit list of device IDs to scope the operation. Omit for whole-tenant.'
+        },
+        confirm: { type: 'boolean', description: 'Set to true to execute the reassignment. Default false (dry-run).' }
+      }
+    }
   }
 ];
 
@@ -1705,6 +1805,129 @@ class NinjaOneMCPServer {
         // ── Phase 4: Device approval ──
         case 'get_pending_devices':
           return this.result(await this.api.getPendingDevices());
+
+        // ── Phase 5: Device owner & search & scripting ──
+        case 'set_device_owner': {
+          if (typeof args.id !== 'number') {
+            throw new McpError(ErrorCode.InvalidParams, 'Device ID must be a number');
+          }
+          if (typeof args.ownerUid !== 'string' || !args.ownerUid) {
+            throw new McpError(ErrorCode.InvalidParams, 'ownerUid must be a non-empty string');
+          }
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const currentOwner = device?.assignedOwnerUid || '(unset)';
+            return this.dryRun(`Would set owner of device id=${args.id} (${device.systemName || device.displayName || 'unknown'}) to ${args.ownerUid}.\nCurrent owner UID: ${currentOwner}`);
+          }
+          return this.result(await this.api.setDeviceOwner(args.id, args.ownerUid));
+        }
+        case 'remove_device_owner': {
+          if (typeof args.id !== 'number') {
+            throw new McpError(ErrorCode.InvalidParams, 'Device ID must be a number');
+          }
+          if (!args.confirm) {
+            const device = await this.api.getDevice(args.id);
+            const currentOwner = device?.assignedOwnerUid || '(already unset)';
+            return this.dryRun(`Would remove owner of device id=${args.id} (${device.systemName || device.displayName || 'unknown'}).\nCurrent owner UID: ${currentOwner}`);
+          }
+          return this.result(await this.api.removeDeviceOwner(args.id));
+        }
+        case 'search_devices':
+          return this.result(await this.api.searchDevices(args.q, args.limit));
+        case 'request_scripting_options':
+          return this.result(await this.api.requestScriptingOptions(args.id, args.lang));
+
+        // ── Phase 5: Ticketing depth ──
+        case 'get_ticket_attributes':
+          return this.result(await this.api.getTicketAttributes());
+        case 'get_ticket_forms':
+          return this.result(await this.api.getTicketForms());
+        case 'get_ticket_form':
+          return this.result(await this.api.getTicketForm(args.formId));
+        case 'get_all_user_and_contacts':
+          return this.result(await this.api.getAllUserAndContacts(args.pageSize, args.anchorNaturalId, args.searchCriteria));
+
+        // ── Phase 5: Workflow — contact-owner → SCIM end-user reassignment ──
+        case 'reassign_contact_owners_to_endusers': {
+          const deviceIds = Array.isArray(args.deviceIds) && args.deviceIds.length > 0
+            ? args.deviceIds.filter((n: any) => typeof n === 'number')
+            : undefined;
+          const plan = await this.api.reassignContactOwnersToEndUsers(deviceIds);
+
+          if (!args.confirm) {
+            const lines: string[] = [];
+            lines.push(`Reassign Plan — scope: ${deviceIds ? `${deviceIds.length} explicit device(s)` : 'ALL DEVICES'}`);
+            lines.push(``);
+            lines.push(`Scanned: ${plan.totalScanned} device(s)`);
+            lines.push(`  would reassign:        ${plan.wouldReassign.length}  (contact owner → matching SCIM end user)`);
+            lines.push(`  already end-user:      ${plan.alreadyEndUser}  (skipped)`);
+            lines.push(`  owner unset:           ${plan.ownerUnset}  (skipped)`);
+            lines.push(`  unmatched:             ${plan.unmatched.length}  (no SCIM end user with matching email)`);
+            lines.push(`  ambiguous:             ${plan.ambiguous.length}  (multiple SCIM end users matched)`);
+            lines.push(`  owner UID orphaned:    ${plan.ownerOrphaned}  (uid not in contact or end-user list)`);
+            if (plan.outOfScope > 0) lines.push(`  out of scope:          ${plan.outOfScope}  (deviceIds not found)`);
+            lines.push(``);
+
+            if (plan.wouldReassign.length > 0) {
+              lines.push(`WILL REASSIGN (${plan.wouldReassign.length}):`);
+              for (const r of plan.wouldReassign.slice(0, 100)) {
+                lines.push(`  device id=${r.deviceId} (${r.deviceName}) — ${r.contactEmail} — contact ${r.contactUid.slice(0, 8)}... → enduser ${r.endUserUid.slice(0, 8)}... (${r.endUserName})`);
+              }
+              if (plan.wouldReassign.length > 100) lines.push(`  ... (${plan.wouldReassign.length - 100} more)`);
+              lines.push(``);
+            }
+            if (plan.unmatched.length > 0) {
+              lines.push(`UNMATCHED (${plan.unmatched.length}) — no SCIM end user with this email:`);
+              for (const r of plan.unmatched.slice(0, 100)) {
+                lines.push(`  device id=${r.deviceId} (${r.deviceName}) — contact: ${r.contactEmail || '(no email)'}`);
+              }
+              if (plan.unmatched.length > 100) lines.push(`  ... (${plan.unmatched.length - 100} more)`);
+              lines.push(``);
+            }
+            if (plan.ambiguous.length > 0) {
+              lines.push(`AMBIGUOUS (${plan.ambiguous.length}) — multiple SCIM end users matched same email:`);
+              for (const r of plan.ambiguous.slice(0, 100)) {
+                lines.push(`  device id=${r.deviceId} (${r.deviceName}) — contact: ${r.contactEmail} — matched ${r.matchedUids.length} end users`);
+              }
+              lines.push(``);
+            }
+            lines.push(`Re-call with confirm=true to execute the ${plan.wouldReassign.length} reassignment(s).`);
+            lines.push(`Skipped devices may need manual handling — ask me to save unmatched/ambiguous as CSV.`);
+
+            return {
+              content: [
+                { type: 'text', text: lines.join('\n') },
+                { type: 'text', text: JSON.stringify(plan) }
+              ]
+            };
+          }
+
+          // Execute
+          const results: Array<{ deviceId: number; success: boolean; error?: string }> = [];
+          for (const r of plan.wouldReassign) {
+            try {
+              await this.api.setDeviceOwner(r.deviceId, r.endUserUid);
+              results.push({ deviceId: r.deviceId, success: true });
+            } catch (e: any) {
+              results.push({ deviceId: r.deviceId, success: false, error: e?.message ?? String(e) });
+            }
+          }
+          const succeeded = results.filter(r => r.success).length;
+          const failed = results.filter(r => !r.success);
+          const out: string[] = [];
+          out.push(`Executed ${results.length} reassignment(s): ${succeeded} succeeded, ${failed.length} failed.`);
+          if (failed.length > 0) {
+            out.push(``);
+            out.push(`FAILED (${failed.length}):`);
+            for (const f of failed) out.push(`  device id=${f.deviceId}: ${f.error}`);
+          }
+          return {
+            content: [
+              { type: 'text', text: out.join('\n') },
+              { type: 'text', text: JSON.stringify({ plan, results }) }
+            ]
+          };
+        }
 
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
